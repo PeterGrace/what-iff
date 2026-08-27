@@ -295,11 +295,36 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 	refreshed, refreshErr := c.refreshTokens(ctx, stale)
 	if !refreshed {
-		// The exchange itself failed (or the caller's context was canceled
-		// while waiting on another goroutine's exchange) — no new token
-		// exists to retry with, so the original 401 is the right error to
-		// surface.
-		return err
+		// The exchange itself failed, or the caller's context was canceled
+		// while waiting on another goroutine's exchange — either way there's
+		// no new token to retry with. The bare original 401 is a bad error
+		// to hand back here: it reads as "your access token is expired,"
+		// which is exactly the thing refreshTokens just silently tried, and
+		// failed, to fix, and it discards a context cancellation entirely.
+		switch {
+		case errors.Is(refreshErr, context.Canceled), errors.Is(refreshErr, context.DeadlineExceeded):
+			// Let cancellation surface as itself — a caller checking
+			// errors.Is(err, context.Canceled) (Ctrl-C) or
+			// context.DeadlineExceeded (a timeout) should see that, not an
+			// unrelated 401 that has nothing to do with why the request
+			// didn't complete.
+			return refreshErr
+		case refreshErr != nil:
+			// Wrap both with %w: the first keeps errors.As(*APIError)
+			// working for a caller that inspects the original status or
+			// message, the second keeps errors.Is/As working against the
+			// refresh failure itself. The prose in between is the part a
+			// human actually reads, and it needs to say the actionable
+			// thing plainly — this is the 14-day refresh-token-expired path
+			// every user eventually hits, and "run wi login" is the only
+			// way out of it.
+			return fmt.Errorf("%w: session could not be renewed, run `wi login` to sign in again: %w", err, refreshErr)
+		default:
+			// refreshTokens only returns (false, nil) in no known path
+			// today, but fall back to the original error rather than a nil
+			// one if that ever changes.
+			return err
+		}
 	}
 	// The exchange succeeded — the client now holds a usable access token in
 	// memory — even if refreshErr is non-nil, which can only mean the
@@ -311,7 +336,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	// and no other channel back to the caller that wouldn't also fail the
 	// request, so refreshErr is deliberately dropped here rather than
 	// invented a reporting path for; the alternative — failing the request —
-	// is exactly the regression this function exists to avoid.
+	// is exactly the regression this function exists to avoid. Once a
+	// logger does exist in this package, a silently-unpersisted refresh
+	// belongs on a debug line here, not surfaced to the caller.
 	_ = refreshErr
 	return c.doJSON(ctx, method, path, body, out)
 }

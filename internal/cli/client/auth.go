@@ -85,18 +85,43 @@ func (c *Client) refreshTokens(ctx context.Context, staleAccess string) (bool, e
 	refresh := c.tokens.Refresh
 	c.mu.Unlock()
 
+	// The leader's cleanup — clearing c.inflight and closing done — runs in a
+	// defer inside this inner closure so it happens no matter how doJSON
+	// exits, panic included. Without this, a panicking RoundTripper (or
+	// anything else that panics out of doJSON) leaves c.inflight set and
+	// done unclosed forever: every later caller becomes a waiter blocked on
+	// a channel nobody will ever close, wedging the client for the rest of
+	// the process. Today an unrecovered panic kills the process anyway, so
+	// this is latent — but a caller that recovers (a TUI event loop, say)
+	// would otherwise inherit a permanently wedged client.
+	//
+	// recover() is what lets this tell "doJSON panicked" apart from
+	// "doJSON returned normally with a nil err" — both would otherwise look
+	// identical to the zero-valued err below, and treating a panic as a nil
+	// error would adopt a zero-valued resp as the new tokens. On a panic,
+	// cleanup still runs (inflight cleared, done closed, no tokens adopted)
+	// and the panic is re-raised afterward so it keeps propagating to the
+	// caller exactly as it would have without this defer.
 	var resp models.LoginResponse
-	err := c.doJSON(ctx, http.MethodPost, "/user/refresh", models.RefreshTokenRequest{RefreshToken: refresh}, &resp)
-
-	c.mu.Lock()
-	c.inflight = nil
+	var err error
 	var updated Tokens
-	if err == nil {
-		updated = Tokens{Access: resp.AccessToken, Refresh: resp.RefreshToken}
-		c.tokens = updated
-	}
-	c.mu.Unlock()
-	close(done)
+	func() {
+		defer func() {
+			r := recover()
+			c.mu.Lock()
+			c.inflight = nil
+			if r == nil && err == nil {
+				updated = Tokens{Access: resp.AccessToken, Refresh: resp.RefreshToken}
+				c.tokens = updated
+			}
+			c.mu.Unlock()
+			close(done)
+			if r != nil {
+				panic(r)
+			}
+		}()
+		err = c.doJSON(ctx, http.MethodPost, "/user/refresh", models.RefreshTokenRequest{RefreshToken: refresh}, &resp)
+	}()
 
 	if err != nil {
 		return false, err

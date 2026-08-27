@@ -810,3 +810,117 @@ func TestDoConcurrentRequestsAllSucceed(t *testing.T) {
 		t.Errorf("/user/refresh called %d times, want exactly 1", got)
 	}
 }
+
+// TestDoSurfacesReauthNeededOnExpiredRefreshToken is the regression test for
+// an expired refresh token (the 14-day path every user eventually hits): the
+// bare original 401 tells the user "your access token is expired," which is
+// exactly what do() just silently, and unsuccessfully, tried to fix. The
+// returned error must say something actionable instead, and still let a
+// caller recover the original *APIError via errors.As.
+func TestDoSurfacesReauthNeededOnExpiredRefreshToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"refresh token expired","code":"token_expired"}`))
+		case "/thing":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"token is expired"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	err := c.do(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil {
+		t.Fatal("do returned nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "wi login") {
+		t.Errorf("error = %q, want it to mention `wi login`", err.Error())
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("errors.As(err, &apiErr) = false, want true")
+	}
+}
+
+// TestDoCancellationDuringRefreshSurfacesAsContextError is the regression
+// test for a waiter's context being canceled while parked on another
+// goroutine's in-flight refresh: the cancellation must surface as itself
+// (errors.Is(err, context.Canceled)), not get discarded in favor of the
+// unrelated 401 that triggered the refresh in the first place.
+func TestDoCancellationDuringRefreshSurfacesAsContextError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			// Slow enough that the waiter's context below is always
+			// canceled well before this responds.
+			time.Sleep(150 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"Unauthorized"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	// Kick off the leader: its do() call 401s on /thing, then becomes the
+	// leader of the slow refresh above.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.do(context.Background(), http.MethodGet, "/thing", nil, nil)
+	}()
+	defer wg.Wait()
+	time.Sleep(20 * time.Millisecond) // give the leader time to claim c.inflight
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	err := c.do(ctx, http.MethodGet, "/thing", nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want errors.Is(err, context.Canceled) = true", err)
+	}
+}
+
+// TestDoDoesNotRetryWhenRefreshFails pins client.go's !refreshed branch
+// returning without a second doJSON call: when the refresh itself fails,
+// there is no new token to retry with, so the protected endpoint must be
+// hit exactly once — a retry here would just be a second, equally doomed,
+// request.
+func TestDoDoesNotRetryWhenRefreshFails(t *testing.T) {
+	var thingCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"refresh token expired"}`))
+		case "/thing":
+			atomic.AddInt32(&thingCalls, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"Unauthorized"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	if err := c.do(context.Background(), http.MethodGet, "/thing", nil, nil); err == nil {
+		t.Fatal("do returned nil error, want error")
+	}
+	if got := atomic.LoadInt32(&thingCalls); got != 1 {
+		t.Errorf("/thing called %d times, want exactly 1 — no retry when the refresh itself failed", got)
+	}
+}
