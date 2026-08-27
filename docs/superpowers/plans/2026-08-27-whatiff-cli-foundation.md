@@ -3762,10 +3762,44 @@ deferred so the signal handler is released once `main` returns normally.
 prints a short "cancelled" instead of the generic wrapped-error message —
 the user asked for this, so it should not read as a crash.
 
-There is no unit test for `main` itself or for the signal wiring: both need a
-real process/terminal to exercise meaningfully. `loadProfile` is unit tested
-below since it is pure; `main`, `run`'s dispatch, and the exit codes are
-covered by manual verification in Task 11's end-to-end check.
+#### Why a subcommand FlagSet cannot just return `fs.Parse`'s error to `run`
+
+An earlier version of this file let `runChats` return `fs.Parse(args)`'s
+error straight through to `run`, which only had two outcomes to give any
+error: success, or `main`'s generic `exit(1)` with the error message repeated
+on stderr. That made `wi chats --help` behave nothing like `wi --help` —
+`flag`'s own default handling printed to stderr and returned a plain error,
+which `main` then re-wrapped and printed *again*, exiting 1 instead of the
+top-level convention's 0 for help and 2 for a genuine mistake. `main` now
+defines two sentinel errors, `errHelpRequested` and `errFlagUsage`, and a
+`parseSubFlags` helper every subcommand FlagSet must be parsed through: it
+prints exactly once, to the stream the case calls for (stdout for help,
+stderr for a bad flag), and returns the matching sentinel so `main`'s error
+switch can pick the same 0/2 exit codes the top level uses — without
+`parseSubFlags` printing the message a second time itself. `printSubUsage`
+exists alongside it because `fs.Usage` is nil unless a caller sets it, and
+`fs.Parse`'s own internal usage call already fired (harmlessly, into
+`io.Discard`) before `parseSubFlags` gets to inspect the error and choose a
+destination stream — calling `fs.Usage()` directly here would nil-panic.
+
+#### Why `loadProfile` wraps a `Resolve` failure with the config file path
+
+`config.Resolve`'s own errors (`internal/cli/config/config.go`) are already
+good — they name the requested profile and list what's available — but they
+say nothing about *where* that list came from. A user with no config file at
+all, running `wi --profile nope chats`, would see `no profile named "nope"
+(available: none)` with no way to tell whether "none" means "you have no
+config file" or "your config file exists and genuinely defines nothing."
+`loadProfile` appends `(config file: <path>)` to any `Resolve` error — using
+the path `config.DefaultPath()` already computed, even when nothing exists at
+it yet, since that path is exactly where the user would create one.
+
+There is no unit test for `main` itself, the signal wiring, or
+`parseSubFlags`/`printSubUsage`'s stdout/stderr routing: all three need a
+real process, a real terminal, or output-stream inspection that a plain unit
+test can't easily do. `loadProfile` is unit tested below since it is pure;
+the rest is covered by manual verification in Task 10's step 4 and Task 11's
+end-to-end check.
 
 - [ ] **Step 1: Write the implementation**
 
@@ -3834,15 +3868,27 @@ func main() {
 	}
 
 	if err := run(ctx, args[0], args[1:], *profile, *asJSON); err != nil {
-		if errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, errHelpRequested):
+			// A subcommand's own FlagSet already printed its usage to stdout
+			// (see parseSubFlags) - nothing left to do here but match the
+			// exit code main's own --help handling above uses.
+			os.Exit(0)
+		case errors.Is(err, errFlagUsage):
+			// A subcommand's own FlagSet already printed the parse error and
+			// its usage to stderr (see parseSubFlags) - do not print err
+			// again here, it would just duplicate that output.
+			os.Exit(2)
+		case errors.Is(err, context.Canceled):
 			// Ctrl-C mid-request: the user asked for this, so it is not an
 			// error worth a scary wrapped message - just say so and leave
 			// with a non-zero status.
 			fmt.Fprintln(os.Stderr, "wi: cancelled")
 			os.Exit(1)
+		default:
+			fmt.Fprintf(os.Stderr, "wi: %v\n", err)
+			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "wi: %v\n", err)
-		os.Exit(1)
 	}
 }
 
@@ -3860,6 +3906,53 @@ Flags:
   --profile <name>   Config profile (default: $WHATIFF_PROFILE, then config)
   --json             Emit JSON instead of human-readable output
 `)
+}
+
+// errHelpRequested and errFlagUsage let a subcommand's FlagSet report the
+// same two special outcomes main's own top-level flag parsing already
+// handles above - a satisfied --help (exit 0, already printed to stdout) and
+// a genuine bad-flag error (exit 2, already printed to stderr) - without
+// falling through to run()'s generic "any error means exit 1". They carry no
+// message of their own because parseSubFlags has already written whatever
+// there was to write; main only needs to tell them apart from a normal error
+// via errors.Is to pick the right exit code.
+var (
+	errHelpRequested = errors.New("help requested")
+	errFlagUsage     = errors.New("flag usage error")
+)
+
+// parseSubFlags parses fs against args using exactly the stdout/exit-0
+// (help) and stderr/exit-2 (bad flag) split main uses for its own top-level
+// flags above. Every subcommand FlagSet must be parsed through this, not
+// fs.Parse directly: fs.Parse alone prints to stderr and returns a plain
+// error for BOTH -h/--help and a genuine mistake, which is what let
+// `wi chats --help` print to stderr and exit 1 (via run()'s generic error
+// handling) while `wi --help` printed to stdout and exited 0 twenty lines
+// away in the same file - and let a bad flag print its message twice, once
+// from flag's own default output and once from main's error wrapper.
+func parseSubFlags(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(io.Discard)
+	switch err := fs.Parse(args); {
+	case errors.Is(err, flag.ErrHelp):
+		printSubUsage(fs, os.Stdout)
+		return errHelpRequested
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "wi %s: %v\n", fs.Name(), err)
+		printSubUsage(fs, os.Stderr)
+		return errFlagUsage
+	}
+	return nil
+}
+
+// printSubUsage writes fs's usage to w, matching flag.FlagSet's own default
+// usage format. It does not use fs.Usage()/fs.Usage - that field is nil
+// unless a caller sets it, and fs.Parse's internal usage call already fired
+// (harmlessly, into io.Discard) before parseSubFlags gets a chance to
+// inspect the error and pick a destination stream.
+func printSubUsage(fs *flag.FlagSet, w io.Writer) {
+	fmt.Fprintf(w, "Usage of %s:\n", fs.Name())
+	fs.SetOutput(w)
+	fs.PrintDefaults()
 }
 
 func run(ctx context.Context, command string, args []string, profileName string, asJSON bool) error {
@@ -3882,6 +3975,12 @@ type session struct {
 
 // loadProfile resolves configuration without requiring credentials. Used by
 // login, which is how credentials come to exist in the first place.
+//
+// A Resolve failure is wrapped with the config file path it was resolved
+// against (even when that file does not exist yet - DefaultPath still names
+// where it would live): without this, an error like `no profile named
+// "nope" (available: none)` leaves a user with no config file wondering
+// where "available" was even supposed to come from.
 func loadProfile(profileName string) (string, config.Profile, error) {
 	path, err := config.DefaultPath()
 	if err != nil {
@@ -3891,7 +3990,11 @@ func loadProfile(profileName string) (string, config.Profile, error) {
 	if err != nil {
 		return "", config.Profile{}, err
 	}
-	return cfg.Resolve(profileName)
+	name, profile, err := cfg.Resolve(profileName)
+	if err != nil {
+		return "", config.Profile{}, fmt.Errorf("%w (config file: %s)", err, path)
+	}
+	return name, profile, nil
 }
 
 // newSession resolves configuration and builds a client carrying stored
@@ -3907,17 +4010,28 @@ func newSession(profileName string) (*session, error) {
 	}
 	creds, err := store.Load(name)
 	if err != nil {
-		if err == config.ErrNoCredentials {
+		if errors.Is(err, config.ErrNoCredentials) {
 			return nil, fmt.Errorf("not logged in to profile %q at %s - run: wi --profile %s login", name, profile.APIURL, name)
 		}
 		return nil, err
 	}
 
 	c := client.New(profile.APIURL, client.Tokens{Access: creds.AccessToken, Refresh: creds.RefreshToken})
+	// username is captured once, read-only, rather than closing over the
+	// mutable creds variable and read-modify-writing it: two overlapping
+	// refreshes (do's single-flight only dedupes within one Client, not
+	// across separate goroutines racing this OnRefresh closure via
+	// unrelated paths) would otherwise be mutating and reading the same
+	// shared creds value with no synchronization. Building a fresh
+	// config.Credentials value inside the closure means each call is
+	// independent of every other call's timing.
+	username := creds.Username
 	c.OnRefresh = func(t client.Tokens) error {
-		creds.AccessToken = t.Access
-		creds.RefreshToken = t.Refresh
-		return store.Save(name, creds)
+		return store.Save(name, config.Credentials{
+			AccessToken:  t.Access,
+			RefreshToken: t.Refresh,
+			Username:     username,
+		})
 	}
 	return &session{profileName: name, profile: profile, client: c}, nil
 }
@@ -3929,8 +4043,9 @@ func newSession(profileName string) (*session, error) {
 forwards to `config.Load`/`config.Resolve`, both already covered, but
 `loadProfile` itself is what `newSession`, `runLogin`, and `runChats` all
 depend on, so its own contract (returns the *resolved* name, not the asked-for
-one; a bad `--profile` produces an actionable error) is worth pinning
-directly rather than only indirectly through those three.
+one; a bad `--profile` produces an actionable error naming both the profile
+and the config file it was resolved against) is worth pinning directly rather
+than only indirectly through those three.
 
 ```go
 package main
@@ -4039,6 +4154,8 @@ and 10 supply them. Do not commit yet.
 
 **Files:**
 - Create: `cmd/whatiff-cli/login.go`
+- Create: `cmd/whatiff-cli/tty_unix.go`
+- Create: `cmd/whatiff-cli/tty_other.go`
 - Test: `cmd/whatiff-cli/login_test.go`
 
 #### Why `promptLine` takes one shared `*bufio.Reader` instead of building its own
@@ -4055,22 +4172,82 @@ heredoc, where a multi-line answer can arrive in one `Read`. `runLogin` now
 constructs exactly one `*bufio.Reader` over `os.Stdin` and threads it through
 both the username and password-adjacent prompts; `promptLine`'s doc comment
 spells out why, so the fix doesn't get "simplified" back to the broken form.
-`TestPromptLine_SharedReaderSeesBothLines` is the regression test: it feeds
-one `*bufio.Reader` wrapping a two-line `strings.Reader` through two
-successive `promptLine` calls and asserts each returns its own line — the
-signature (`*bufio.Reader` in, not `io.Reader`) makes the fix structural: any
-implementation that re-wraps its argument in a fresh `bufio.NewReader` each
-call fails this test, since the wrapped `strings.Reader` gets fully drained on
-the first call.
 
-#### Why there is still no `--password` flag or env var
+`TestPromptLine_SharedReaderSeesBothLines` exercises this — but it is *not* a
+mutation test for "a fresh `bufio.Reader` per call," and its own comment says
+so explicitly. `bufio.NewReader(rd)` special-cases an `rd` that is already a
+`*bufio.Reader` with a large enough buffer and returns it unchanged rather
+than wrapping it, so even a `promptLine` that re-wrapped its argument
+(`bufio.NewReader(r).ReadString('\n')`) on every call would still pass this
+test — `r` comes back as itself. The actual fix is the function's *signature*:
+taking `*bufio.Reader`, not `io.Reader`, forces every caller to construct
+exactly one reader for a whole prompt sequence, because raw `os.Stdin` (an
+`io.Reader` that is *not* already a `*bufio.Reader`) is what the short-circuit
+does not apply to, and re-wrapping *that* fresh each call is what the original
+bug depended on. The signature makes the bug impossible to reintroduce by
+construction; the test only pins ordinary two-line reading behavior.
 
-Unchanged from the original design and repeated here because it's easy to
-"helpfully" add back under pressure to script `wi login`: a flag would put the
-password in shell history and in every process listing on the machine
-(`ps aux` on a shared box), matching the precedent in `cmd/create-superuser`.
-`promptPassword` requires a TTY (`term.IsTerminal`) and refuses otherwise —
-there is deliberately no way to feed it a password non-interactively.
+#### Why a pasted password gets echoed, and what `flushPendingInput` can and cannot do about it
+
+Reproduced against a real pty: piping `"alice\nhunter2\n"` into the terminal
+as a single write — exactly what a paste from a password manager looks like —
+shows both lines on screen, including the password, *before* `promptPassword`
+ever runs. The mechanism is not the `bufio` read-ahead problem above: in
+canonical terminal mode the kernel delivers one line per `read()`, so the
+username prompt's read only ever consumes `"alice\n"`. The password line is
+still sitting in the *kernel tty driver's* own input queue — invisible to any
+Go-level buffering — and the driver echoes every byte to the screen the
+instant it arrives, because local echo is still on; it is only turned off once
+`term.ReadPassword` runs, by which point the password has already been echoed
+and is sitting in scrollback.
+
+`flushPendingInput` (`tty_unix.go`) is the fix, and it is the same trick
+`sudo` uses immediately before its own password prompt: `promptPassword`
+calls it right before turning off echo, discarding whatever the tty driver
+has queued via `TCFLSH`/`TCIFLUSH` so the stale line can never be silently
+read back as the password once echo is off. **It cannot undo the echo that
+already happened.** The paste is already on screen and in scrollback; the
+flush only prevents it from being *used*. `promptPassword` is honest about
+this distinction: when `flushPendingInput` reports something was actually
+discarded, it prints `warning: discarded pending input before the password
+prompt - if you pasted your password it may be visible in your terminal
+history` to stderr. An ordinary typed login — nothing queued when the flush
+runs — stays silent; the warning is not printed "just in case."
+
+`flushPendingInput` needs `unix.Poll` (not a `FIONREAD` ioctl) to check
+whether anything was pending *before* discarding it: `golang.org/x/sys/unix`
+does not export a `FIONREAD` constant in this module's pinned version (or, it
+turns out, any version), so a zero-timeout `POLLIN` poll answers the same
+yes/no question `flushPendingInput`'s caller needs, without reading (and thus
+itself consuming) the queued bytes. The function is split across two
+build-tagged files so the package still builds on non-unix platforms: the
+`unix` tag (Go's recognized shorthand for the whole `aix`/`darwin`/
+`dragonfly`/`freebsd`/`hurd`/`illumos`/`ios`/`linux`/`netbsd`/`openbsd`/
+`solaris` family) gets the real ioctl-based implementation; everything else
+gets a no-op that always reports nothing was discarded — honest, since on
+those platforms nothing was.
+
+This is the one place `go.mod` changes in this task: `golang.org/x/sys` was
+already present as an *indirect* dependency (pulled in transitively); using
+`golang.org/x/sys/unix` directly promotes it to a direct one. `go mod tidy`
+picks up exactly that move — no version change, no new module, `go.sum`
+untouched — and `make tidy` must still pass.
+
+#### Why `runLogin`'s empty-username guard is its own function
+
+`validateUsername` used to be two inline lines in `runLogin`
+(`if username == "" { return fmt.Errorf(...) }`). `runLogin` itself talks to
+a real network and a real terminal, so it can't be unit tested end to end —
+which left that guard reachable only by a human actually running `wi login`
+and pressing enter at the first prompt. Pulling it out as its own function
+gives it a direct test (`TestValidateUsername`) that fails the moment the
+guard is weakened or removed, independent of anything else in the login flow.
+
+There is no unit test for `promptPassword`'s TTY-required path or the
+`flushPendingInput` build-tagged files themselves — both need a real terminal
+(a pty, specifically, to reproduce the paste-echo scenario) rather than
+anything `go test` can drive directly. See Task 10's step 4 for the manual
+(pty-scripted) verification of both the paste and the ordinary-login cases.
 
 - [ ] **Step 1: Write the implementation**
 
@@ -4112,8 +4289,8 @@ func runLogin(ctx context.Context, profileName string) error {
 	if err != nil {
 		return err
 	}
-	if username == "" {
-		return fmt.Errorf("username is required")
+	if err := validateUsername(username); err != nil {
+		return err
 	}
 
 	password, err := promptPassword("Password: ")
@@ -4147,6 +4324,21 @@ func runLogin(ctx context.Context, profileName string) error {
 	return nil
 }
 
+// validateUsername rejects an empty username before any network call is
+// attempted.
+//
+// Pulled out of runLogin as its own function so this guard has a test
+// pinning it directly (TestValidateUsername): runLogin itself talks to a
+// real network and a real terminal, so it cannot be unit tested end to end,
+// which would otherwise leave this check reachable only by a human running
+// `wi login` and pressing enter at the first prompt.
+func validateUsername(username string) error {
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	return nil
+}
+
 // promptLine prints prompt, then reads one line from r.
 //
 // r must be a single *bufio.Reader shared across every prompt in a sequence -
@@ -4176,6 +4368,26 @@ func promptPassword(prompt string) (string, error) {
 	if !term.IsTerminal(fd) {
 		return "", fmt.Errorf("password entry requires an interactive terminal")
 	}
+
+	// Discard anything already queued by the terminal driver before turning
+	// off echo. A paste of "username\npassword\n" delivered as one write
+	// leaves the password line sitting in the driver's input queue after the
+	// username prompt above has consumed its own line - and that queued line
+	// gets echoed to the screen the instant it arrives, before this function
+	// ever runs, because echo is still on until term.ReadPassword below
+	// turns it off. See flushPendingInput's doc comment (tty_unix.go) for
+	// why this is the same defense sudo uses. The flush error is ignored
+	// deliberately: it is best-effort hardening, not a prerequisite for
+	// reading a password, so a failing ioctl must not fail the whole login.
+	discarded, _ := flushPendingInput(fd)
+	if discarded {
+		// This cannot undo the echo that already happened - only prevent the
+		// stale bytes from being silently accepted as the password. Say so
+		// plainly rather than letting a user assume the paste never reached
+		// the screen.
+		fmt.Fprintln(os.Stderr, "warning: discarded pending input before the password prompt - if you pasted your password it may be visible in your terminal history")
+	}
+
 	fmt.Print(prompt)
 	raw, err := term.ReadPassword(fd)
 	fmt.Println()
@@ -4186,7 +4398,73 @@ func promptPassword(prompt string) (string, error) {
 }
 ```
 
-- [ ] **Step 2: Write the regression test for the reader-sharing fix**
+```go
+//go:build unix
+
+package main
+
+import "golang.org/x/sys/unix"
+
+// flushPendingInput discards any input already queued by the terminal
+// driver for fd, and reports whether it actually discarded something.
+//
+// This is the same trick sudo uses immediately before its own password
+// prompt. The problem it defends against: pasting "alice\nhunter2\n" into a
+// terminal arrives at the tty driver as one write, and the driver echoes
+// every byte of it - including the password half - to the screen as it
+// lands, because local echo is still on at that point; it is only turned off
+// once promptPassword calls term.ReadPassword, by which time the password
+// has already been echoed and is sitting in scrollback. In canonical mode
+// the kernel delivers one line per read(), so the prompt sequence's username
+// read consumes only "alice\n" and leaves "hunter2\n" queued in the driver's
+// own buffer, invisible to anything done in Go-level buffering (bufio.Reader
+// included) - only the kernel can discard it. TCIFLUSH does that, so the
+// stale line can never be silently read back as the password once echo is
+// off. It cannot undo the echo that already happened - the caller is
+// responsible for warning about that separately, using this function's
+// reported bool to know whether there was anything to warn about.
+//
+// Whether anything was pending is checked with a zero-timeout unix.Poll
+// (POLLIN) immediately before the flush, not by reading: a read would
+// consume bytes itself rather than leaving the flush to do it, and this
+// package has no portable FIONREAD-equivalent available in
+// golang.org/x/sys/unix to ask the kernel "how many bytes" directly across
+// every GOOS this build tag covers. Poll only answers yes/no, which is all
+// the caller needs to decide whether to print a warning.
+func flushPendingInput(fd int) (bool, error) {
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 0)
+	if err != nil {
+		return false, err
+	}
+	pending := n > 0 && fds[0].Revents&unix.POLLIN != 0
+
+	if err := unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH); err != nil {
+		return false, err
+	}
+	return pending, nil
+}
+```
+
+```go
+//go:build !unix
+
+package main
+
+// flushPendingInput is a no-op on non-unix platforms (Windows): there is no
+// TCFLSH-equivalent wired up here, so a paste landing on the terminal
+// immediately before the password prompt is not defended against on those
+// platforms. Rather than pretending otherwise, this always reports that
+// nothing was discarded - which is honest, since flushPendingInput's only
+// caller (promptPassword) uses the returned bool solely to decide whether to
+// print a warning about discarded input, and printing that warning here
+// would be a lie.
+func flushPendingInput(fd int) (bool, error) {
+	return false, nil
+}
+```
+
+- [ ] **Step 2: Write the tests**
 
 ```go
 package main
@@ -4197,12 +4475,25 @@ import (
 	"testing"
 )
 
-// TestPromptLine_SharedReaderSeesBothLines is the regression test for
-// Correction 2: a *bufio.Reader created fresh on every promptLine call can
-// buffer bytes past the first newline and then discard them, since the next
-// call's reader starts with an empty buffer of its own. It fails against a
-// promptLine that does bufio.NewReader(r).ReadString('\n') internally on each
-// call, and passes when a single reader is threaded through both prompts.
+// TestPromptLine_SharedReaderSeesBothLines exercises promptLine reading two
+// sequential lines off one shared *bufio.Reader.
+//
+// This is NOT a mutation test for a "fresh bufio.Reader per call"
+// regression, despite an earlier version of this comment claiming it was:
+// bufio.NewReader(rd) special-cases an rd that is already a *bufio.Reader
+// with a large enough internal buffer and returns it unchanged rather than
+// wrapping it (see the "Is it already a Reader?" check in
+// bufio.NewReaderSize). So even a promptLine that did
+// bufio.NewReader(r).ReadString('\n') internally on every call would still
+// pass this test - r would just come back as itself, unwrapped, and behave
+// identically. The real fix for the original bug is the function signature:
+// promptLine takes a *bufio.Reader, not an io.Reader, which forces every
+// caller to construct exactly one reader for a whole prompt sequence instead
+// of re-wrapping raw stdin (an io.Reader that is NOT already a *bufio.Reader,
+// so the short-circuit above does not apply to it) fresh on each call - that
+// mismatch is what the original bug depended on. The signature makes the bug
+// impossible to reintroduce by construction; this test only pins ordinary
+// two-line behavior, not that construction.
 func TestPromptLine_SharedReaderSeesBothLines(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader("alice\nswordfish\n"))
 
@@ -4255,24 +4546,37 @@ func TestPromptLine_EmptyInputErrors(t *testing.T) {
 		t.Fatal("expected an error reading from an empty/exhausted reader")
 	}
 }
+
+// TestValidateUsername is the direct test for the guard runLogin applies
+// before ever making a network call or prompting for a password - see
+// validateUsername's doc comment for why it is unit tested on its own rather
+// than only indirectly, by running the whole interactive login flow.
+func TestValidateUsername(t *testing.T) {
+	if err := validateUsername("alice"); err != nil {
+		t.Errorf("validateUsername(%q) = %v, want nil", "alice", err)
+	}
+	if err := validateUsername(""); err == nil {
+		t.Error("validateUsername(\"\") = nil, want an error rejecting the empty username")
+	}
+}
 ```
 
 - [ ] **Step 3: Run the tests and verify the binary compiles**
 
-Run: `go test ./cmd/whatiff-cli/ -run TestPromptLine -race -v && go build ./cmd/whatiff-cli/`
-Expected: the `TestPromptLine_*` tests pass; the build still fails on
-`undefined: runChats` only. Task 10 finishes it.
+Run: `go test ./cmd/whatiff-cli/ -run 'TestPromptLine|TestValidateUsername' -race -v && go build ./cmd/whatiff-cli/`
+Expected: all `TestPromptLine_*` and `TestValidateUsername` tests pass; the
+build still fails on `undefined: runChats`, `undefined: parseSubFlags`
+resolves fine (it lives in `main.go`, already written), and
+`undefined: normalizeResultsForJSON`/`sanitizeCell`/`truncationNotice` are
+not referenced yet outside `chats.go`. Task 10 finishes the build.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: `go mod tidy` and confirm the dependency change is exactly what was intended**
 
-```bash
-git add cmd/whatiff-cli/main.go cmd/whatiff-cli/main_test.go cmd/whatiff-cli/login.go cmd/whatiff-cli/login_test.go
-git commit -m "feat(cli): wi login command"
-```
-
-This commit does not compile alone — `run` also dispatches to `runChats`,
-supplied by Task 10. That is expected; `go build ./...` is not green again
-until Task 10's commit lands.
+Run: `go mod tidy && git diff go.mod`
+Expected: `golang.org/x/sys v0.47.0` moves from the `// indirect` block to the
+direct `require` block; no version changes; `go.sum` is unchanged. Then run
+`make tidy` (after `git add go.mod`, since the check compares against the
+last commit) and confirm it passes.
 
 ### Task 10: `wi chats`
 
@@ -4280,9 +4584,9 @@ until Task 10's commit lands.
 - Create: `cmd/whatiff-cli/chats.go`
 - Test: `cmd/whatiff-cli/chats_test.go`
 
-#### Why `runChats` prints a truncation notice and `--json` emits the whole `ChatPage`
+#### Why `runChats` prints a truncation notice to stderr, and `--json` emits the whole `ChatPage`
 
-`ListChats` returns `ChatPage{Results, TotalCount}` specifically so a capped
+`ListChats` returns `ChatPage{{Results, TotalCount}}` specifically so a capped
 listing can be told apart from an account that only has that many chats (see
 `ChatPage`'s doc comment in `internal/cli/client/chat.go`) — but a command
 that decodes `page.Results` and prints only that throws the one piece of
@@ -4290,10 +4594,13 @@ information `ChatPage` exists to carry straight back on the floor, one layer
 up from where Task 7 fixed the same failure inside the client. `runChats`
 pulls the decision into `truncationNotice(page client.ChatPage) string`,
 which returns `""` when nothing was cut off and otherwise a line like
-`Showing 100 of 347 chats. Use --limit to see more.`, printed after the table.
-`--json` mode encodes the whole `page`, not `page.Results`, so a script
-consuming `wi chats --json` has the same total available to it that the human
-table does.
+`Showing 100 of 347 chats. Use --limit to see more.` — printed to **stderr**,
+after the table, not stdout: it is an advisory sentence about the listing, not
+part of it, and `wi chats | grep -c .` (or any other line-counting or
+line-parsing consumer) must not have to know to skip a trailing line mixed
+into its data. `--json` mode never reaches that print at all, since it
+returns earlier — a script already has `TotalCount` in the payload to check
+for itself.
 
 `truncationNotice` is pulled out of the print loop into its own function so
 this — the entire reason `ChatPage` carries `TotalCount` instead of a bare
@@ -4301,18 +4608,38 @@ slice — has a table-driven test pinning it (`TestTruncationNotice`), rather
 than living as a couple of inline lines after the loop that a future edit
 could delete without anything noticing.
 
-#### Why `humanizeSince` gets a table-driven test across its bucket boundaries
+#### Why `--json` normalizes a nil `Results` to an empty slice
 
-`humanizeSince` has four branches (`< time.Minute`, `< time.Hour`,
-`< 24*time.Hour`, else) each doing integer-truncating division
-(`int(d.Minutes())` etc.), which is exactly the kind of boundary logic that's
-easy to get off-by-one on and easy to leave untested since it "obviously
-works." `TestHumanizeSince` picks a duration comfortably inside each bucket
-(10s, 45m, 5h, 3d) plus one just past each lower boundary (90s, 90m, 25h) to
-pin the rounding-down behavior, rather than testing exact boundary instants —
-`time.Since` is evaluated against `time.Now()` at call time, so a test built
-on an exact `time.Minute`/`time.Hour` boundary would be one scheduler hiccup
-away from flaking onto the wrong side of it.
+`encoding/json` encodes a nil slice as the JSON literal `null`, not `[]`. The
+server can send `"results"` as `null`, or omit the key entirely — either one
+decodes into a nil `Results` (see `internal/cli/client/chat_test.go`'s
+`TestListChatsMissingResultsField`/`TestListChatsNullResultsField`) — so
+without normalization, `wi chats --json` on an empty account emits
+`{{"results":null,...}}`. A script doing `jq '.results[]'` or a naive
+for-range loop over the decoded field breaks on `null` in a way it would not
+on `[]`, for a value that means exactly the same thing either way: no chats.
+`normalizeResultsForJSON` is a separate pure function (rather than an inline
+`if` before `enc.Encode`) so `TestNormalizeResultsForJSON_NilBecomesEmptySlice`
+can assert on the actual encoded bytes — `"results":[]`, not merely "the
+Go slice is non-nil" — which is the property that actually matters to a
+downstream `jq` or JSON parser.
+
+#### Why chat names and model names go through `sanitizeCell` before hitting the tabwriter
+
+`Name` and `ModelName` are server-controlled, user-supplied text reaching a
+terminal — the same class of problem `internal/cli/client`'s `snippet()`
+(`client.go`) already solves for a raw HTTP error body. Unsanitized, an ANSI
+or OSC escape sequence in a chat name could forge terminal output or rename
+the tab, and an embedded tab or newline would shift every column after it in
+the table. `sanitizeCell` mirrors `snippet`'s approach — collapse whitespace
+runs to a single space first (via `strings.Fields`/`strings.Join`, so an
+internal tab or newline doesn't just vanish and glue two words together),
+then drop anything `unicode.IsPrint` rejects (which strips a lone ESC byte
+while leaving the now-inert literal characters after it, e.g. `[31m`, as
+plain text) — reimplemented locally rather than imported, because
+`internal/cli/client` is a thin HTTP transport with no terminal-rendering
+concern of its own; the doc comment on `sanitizeCell` is what keeps the two
+implementations in step if one of them changes.
 
 - [ ] **Step 1: Write the implementation**
 
@@ -4325,10 +4652,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
+	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
 
 // defaultChatLimit overrides the server's page size, which is 10
@@ -4341,7 +4671,7 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 	archived := fs.Bool("archived", false, "list archived chats instead of active ones")
 	search := fs.String("search", "", "filter by name or checkpoint summary")
 	limit := fs.Int("limit", defaultChatLimit, "maximum chats to return")
-	if err := fs.Parse(args); err != nil {
+	if err := parseSubFlags(fs, args); err != nil {
 		return err
 	}
 
@@ -4367,7 +4697,7 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 		// which is exactly the ambiguity TotalCount exists to resolve.
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(page)
+		return enc.Encode(normalizeResultsForJSON(page))
 	}
 
 	if len(page.Results) == 0 {
@@ -4386,18 +4716,30 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 		if c.UnreadCount > 0 {
 			unread = fmt.Sprintf("%d", c.UnreadCount)
 		}
-		model := c.ModelName
+		// Name and ModelName are server-controlled, user-supplied text
+		// reaching a terminal - sanitizeCell strips it the same way
+		// internal/cli/client's snippet() already does for error bodies
+		// (see sanitizeCell's doc comment for why this doesn't just import
+		// that function instead).
+		name := sanitizeCell(c.Name)
+		model := sanitizeCell(c.ModelName)
 		if model == "" {
 			model = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.Name, model, last, unread)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, model, last, unread)
 	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
 
+	// stderr, not stdout: this is an advisory line about the listing, not
+	// part of it. `wi chats | grep -c .` (or any other line-counting or
+	// line-parsing consumer of the table) must not have to know to skip a
+	// trailing sentence mixed into its data. --json mode never reaches this
+	// line at all (it returns above) since TotalCount is already in that
+	// payload for a script to check itself.
 	if notice := truncationNotice(page); notice != "" {
-		fmt.Println(notice)
+		fmt.Fprintln(os.Stderr, notice)
 	}
 	return nil
 }
@@ -4415,6 +4757,49 @@ func truncationNotice(page client.ChatPage) string {
 		return ""
 	}
 	return fmt.Sprintf("Showing %d of %d chats. Use --limit to see more.", len(page.Results), page.TotalCount)
+}
+
+// normalizeResultsForJSON replaces a nil page.Results with an empty, non-nil
+// slice before it is handed to json.Marshal/json.Encoder.
+//
+// encoding/json encodes a nil slice as the JSON literal null, not []. The
+// server can send "results" as null, or omit it entirely - either decodes
+// into a nil Results (see internal/cli/client/chat_test.go's
+// TestListChatsMissingResultsField/TestListChatsNullResultsField) - and
+// without this, `wi chats --json` on an empty account emits
+// {"results":null,...}. A script doing `jq '.results[]'` or a naive
+// for-range loop over the decoded field breaks on null in a way it would not
+// on [], which is a needless trap for a value that means exactly the same
+// thing either way: no chats.
+func normalizeResultsForJSON(page client.ChatPage) client.ChatPage {
+	if page.Results == nil {
+		page.Results = []models.Chat{}
+	}
+	return page
+}
+
+// sanitizeCell strips non-printable characters from s and collapses any
+// whitespace runs (including a tab or newline embedded in a chat name) to a
+// single space, so server-controlled text is safe to print unescaped into a
+// tabwriter cell.
+//
+// This mirrors internal/cli/client's snippet() (client.go), which solves the
+// identical problem for a raw HTTP error body reaching a terminal: without
+// stripping, a chat name containing an ANSI/OSC escape sequence could forge
+// terminal output or rename the tab, and an embedded tab or newline would
+// shift every column after it in the table. It is reimplemented here rather
+// than imported because the client package is a thin HTTP transport with no
+// terminal-rendering concern of its own - that split is deliberate, not an
+// oversight, so this comment is what keeps the two implementations in step
+// if one of them changes.
+func sanitizeCell(s string) string {
+	collapsed := strings.Join(strings.Fields(s), " ")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, collapsed)
 }
 
 // humanizeSince renders a coarse relative time. Chat listings are scanned, not
@@ -4441,6 +4826,8 @@ func humanizeSince(t time.Time) string {
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -4499,6 +4886,66 @@ func TestHumanizeSince(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeResultsForJSON_NilBecomesEmptySlice is the regression test
+// for a nil page.Results (the server sent "results":null, or omitted the
+// field - see internal/cli/client/chat_test.go's
+// TestListChatsMissingResultsField/TestListChatsNullResultsField) still
+// encoding as [] rather than null.
+func TestNormalizeResultsForJSON_NilBecomesEmptySlice(t *testing.T) {
+	page := normalizeResultsForJSON(client.ChatPage{TotalCount: 0})
+	if page.Results == nil {
+		t.Fatal("Results is still nil, want a non-nil empty slice")
+	}
+	if len(page.Results) != 0 {
+		t.Errorf("len(Results) = %d, want 0", len(page.Results))
+	}
+
+	data, err := json.Marshal(page)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"results":null`) {
+		t.Errorf("encoded page still has null results: %s", data)
+	}
+	if !strings.Contains(string(data), `"results":[]`) {
+		t.Errorf("encoded page does not have an empty-array results: %s", data)
+	}
+}
+
+// TestNormalizeResultsForJSON_LeavesNonNilResultsAlone guards against an
+// overzealous fix that replaces every Results slice rather than only a nil
+// one - a real chat list must survive unchanged.
+func TestNormalizeResultsForJSON_LeavesNonNilResultsAlone(t *testing.T) {
+	want := []models.Chat{{Name: "deploy plan"}}
+	page := normalizeResultsForJSON(client.ChatPage{Results: want, TotalCount: 1})
+	if len(page.Results) != 1 || page.Results[0].Name != "deploy plan" {
+		t.Errorf("Results = %+v, want unchanged %+v", page.Results, want)
+	}
+}
+
+func TestSanitizeCell(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain text unchanged", "deploy plan", "deploy plan"},
+		{"embedded tab collapsed to a single space", "deploy\tplan", "deploy plan"},
+		{"embedded newline collapsed to a single space", "deploy\nplan", "deploy plan"},
+		{"ANSI escape byte stripped, literal text survives", "\x1b[31mdanger\x1b[0m", "[31mdanger[0m"},
+		{"leading and trailing whitespace trimmed", "  spaced  ", "spaced"},
+		{"empty string stays empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeCell(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitizeCell(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
 ```
 
 - [ ] **Step 3: Verify the binary builds and every test passes**
@@ -4509,37 +4956,63 @@ binary now compiles end to end.
 
 - [ ] **Step 4: Manually verify the binary's behavior**
 
-The binary has never been run interactively before this task; the tests above
-cover the pure logic, but exit codes, stdout/stderr routing, and the
-not-logged-in / unknown-profile / non-TTY-password error paths only show up by
-actually running it. Build it and check each of the following (no server
-needs to be running — Task 11 does the live end-to-end check against one):
+Exit codes, stdout/stderr routing, and the not-logged-in / unknown-profile /
+non-TTY-password / pasted-password error paths only show up by actually
+running the binary — no server needs to be running for any of these (Task 11
+does the live end-to-end check against one).
 
 ```bash
 go build -o bin/wi ./cmd/whatiff-cli
-./bin/wi                    # usage on stderr, exit 2
-./bin/wi --help              # usage on stdout, exit 0
-./bin/wi bogus                # unknown command error, exit 1
-./bin/wi chats                # not-logged-in error naming the profile and URL, exit 1
-./bin/wi --profile nope chats # unknown-profile error listing available profiles, exit 1
-echo "" | ./bin/wi login      # refuses without ever reaching an insecure password prompt, exit 1
+./bin/wi                       # usage on stderr, exit 2
+./bin/wi --help                 # usage on stdout, exit 0
+./bin/wi bogus                   # unknown command error, exit 1
+./bin/wi chats                    # not-logged-in error naming the profile and URL, exit 1
+./bin/wi --profile nope chats      # unknown-profile error listing available profiles
+                                     # and the config file path, exit 1
+./bin/wi chats --help                # chats' own usage on stdout, exit 0 (matches
+                                       # the top-level --help convention)
+./bin/wi chats --bogus                 # chats' own parse error + usage, printed once,
+                                         # to stderr, exit 2 (matches the top-level
+                                         # convention, not run()'s generic exit 1)
 ```
 
-Note on the last check: piping a single empty line supplies (and consumes)
-the *username* prompt's answer, so the observed failure is `username is
-required`, not `password entry requires an interactive terminal` — the
-TTY check never gets reached in that exact input shape. The TTY refusal is
-still real and reachable; confirm it separately by supplying a non-empty
-username and leaving the password prompt to hit non-TTY stdin, e.g.
-`printf 'alice\n' | ./bin/wi login`, which fails with `password entry
-requires an interactive terminal`.
+`wi chats | grep -c .` against a real listing (Task 11's end-to-end check, or
+a local mock server) should count only the header and data rows — the
+truncation notice on stderr must not appear in that count.
+
+The pasted-password defense needs a pty to reproduce, since the exploit
+depends on kernel tty echo behavior a piped `echo "x" | wi login` cannot
+trigger (piped stdin is not a terminal at all, so `promptPassword` refuses it
+outright — see Task 9's TTY-required check). Script one (Python's `pty`
+module works well): open a pty, run `wi login` with all three of stdin/
+stdout/stderr attached to the slave side, wait for the username prompt, then
+write `b"alice
+hunter2
+"` as a *single* `os.write()` call to the master side
+to simulate a paste. Confirm:
+
+- `alice` and `hunter2` both appear in the echoed output (the echo itself is
+  not preventable — see this task's `#### Why` section above).
+- The stderr warning appears exactly once.
+- After that write, the process **blocks** without producing further output
+  until a *new* write supplies the real password — proving the stale
+  `hunter2` line was discarded rather than silently accepted as the answer to
+  the password prompt.
+
+Then repeat with the username and password written as two *separate*,
+naturally-spaced writes (not a paste) and confirm the warning does **not**
+appear — a normal login must stay silent.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/whatiff-cli/chats.go cmd/whatiff-cli/chats_test.go
-git commit -m "feat(cli): wi chats command"
+git add cmd/whatiff-cli/ .gitignore go.mod
+git commit -m "fix(cli): stop a pasted password reaching the terminal"
 ```
+
+`go.mod` is included deliberately and only for the `golang.org/x/sys`
+indirect-to-direct promotion described in Task 9 — `go.sum`, `go work`, and
+`ent/` are never part of this commit.
 
 ### Task 11: Makefile targets, package docs, and an end-to-end check
 

@@ -6,12 +6,25 @@ import (
 	"testing"
 )
 
-// TestPromptLine_SharedReaderSeesBothLines is the regression test for
-// Correction 2: a *bufio.Reader created fresh on every promptLine call can
-// buffer bytes past the first newline and then discard them, since the next
-// call's reader starts with an empty buffer of its own. It fails against a
-// promptLine that does bufio.NewReader(r).ReadString('\n') internally on each
-// call, and passes when a single reader is threaded through both prompts.
+// TestPromptLine_SharedReaderSeesBothLines exercises promptLine reading two
+// sequential lines off one shared *bufio.Reader.
+//
+// This is NOT a mutation test for a "fresh bufio.Reader per call"
+// regression, despite an earlier version of this comment claiming it was:
+// bufio.NewReader(rd) special-cases an rd that is already a *bufio.Reader
+// with a large enough internal buffer and returns it unchanged rather than
+// wrapping it (see the "Is it already a Reader?" check in
+// bufio.NewReaderSize). So even a promptLine that did
+// bufio.NewReader(r).ReadString('\n') internally on every call would still
+// pass this test - r would just come back as itself, unwrapped, and behave
+// identically. The real fix for the original bug is the function signature:
+// promptLine takes a *bufio.Reader, not an io.Reader, which forces every
+// caller to construct exactly one reader for a whole prompt sequence instead
+// of re-wrapping raw stdin (an io.Reader that is NOT already a *bufio.Reader,
+// so the short-circuit above does not apply to it) fresh on each call - that
+// mismatch is what the original bug depended on. The signature makes the bug
+// impossible to reintroduce by construction; this test only pins ordinary
+// two-line behavior, not that construction.
 func TestPromptLine_SharedReaderSeesBothLines(t *testing.T) {
 	r := bufio.NewReader(strings.NewReader("alice\nswordfish\n"))
 
@@ -62,5 +75,18 @@ func TestPromptLine_EmptyInputErrors(t *testing.T) {
 	_, err := promptLine(r, "")
 	if err == nil {
 		t.Fatal("expected an error reading from an empty/exhausted reader")
+	}
+}
+
+// TestValidateUsername is the direct test for the guard runLogin applies
+// before ever making a network call or prompting for a password - see
+// validateUsername's doc comment for why it is unit tested on its own rather
+// than only indirectly, by running the whole interactive login flow.
+func TestValidateUsername(t *testing.T) {
+	if err := validateUsername("alice"); err != nil {
+		t.Errorf("validateUsername(%q) = %v, want nil", "alice", err)
+	}
+	if err := validateUsername(""); err == nil {
+		t.Error("validateUsername(\"\") = nil, want an error rejecting the empty username")
 	}
 }

@@ -35,8 +35,8 @@ func runLogin(ctx context.Context, profileName string) error {
 	if err != nil {
 		return err
 	}
-	if username == "" {
-		return fmt.Errorf("username is required")
+	if err := validateUsername(username); err != nil {
+		return err
 	}
 
 	password, err := promptPassword("Password: ")
@@ -70,6 +70,21 @@ func runLogin(ctx context.Context, profileName string) error {
 	return nil
 }
 
+// validateUsername rejects an empty username before any network call is
+// attempted.
+//
+// Pulled out of runLogin as its own function so this guard has a test
+// pinning it directly (TestValidateUsername): runLogin itself talks to a
+// real network and a real terminal, so it cannot be unit tested end to end,
+// which would otherwise leave this check reachable only by a human running
+// `wi login` and pressing enter at the first prompt.
+func validateUsername(username string) error {
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	return nil
+}
+
 // promptLine prints prompt, then reads one line from r.
 //
 // r must be a single *bufio.Reader shared across every prompt in a sequence -
@@ -99,6 +114,26 @@ func promptPassword(prompt string) (string, error) {
 	if !term.IsTerminal(fd) {
 		return "", fmt.Errorf("password entry requires an interactive terminal")
 	}
+
+	// Discard anything already queued by the terminal driver before turning
+	// off echo. A paste of "username\npassword\n" delivered as one write
+	// leaves the password line sitting in the driver's input queue after the
+	// username prompt above has consumed its own line - and that queued line
+	// gets echoed to the screen the instant it arrives, before this function
+	// ever runs, because echo is still on until term.ReadPassword below
+	// turns it off. See flushPendingInput's doc comment (tty_unix.go) for
+	// why this is the same defense sudo uses. The flush error is ignored
+	// deliberately: it is best-effort hardening, not a prerequisite for
+	// reading a password, so a failing ioctl must not fail the whole login.
+	discarded, _ := flushPendingInput(fd)
+	if discarded {
+		// This cannot undo the echo that already happened - only prevent the
+		// stale bytes from being silently accepted as the password. Say so
+		// plainly rather than letting a user assume the paste never reached
+		// the screen.
+		fmt.Fprintln(os.Stderr, "warning: discarded pending input before the password prompt - if you pasted your password it may be visible in your terminal history")
+	}
+
 	fmt.Print(prompt)
 	raw, err := term.ReadPassword(fd)
 	fmt.Println()
