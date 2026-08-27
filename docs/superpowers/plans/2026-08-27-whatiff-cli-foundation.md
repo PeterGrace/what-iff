@@ -655,6 +655,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -718,11 +719,157 @@ func TestLoadMissingProfileReturnsErrNoCredentials(t *testing.T) {
 		t.Fatalf("Load = %v, want ErrNoCredentials", err)
 	}
 }
+
+func TestLoadProfileMissingFromPopulatedFileReturnsErrNoCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store := CredentialStore{Path: path}
+	if err := store.Save("hosted", Credentials{AccessToken: "hosted-acc"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file exists and parses fine; it just has no "local" entry. This is
+	// a different code path than the missing-file case above (the !ok branch
+	// after a successful readAll, not the os.ErrNotExist branch).
+	if _, err := store.Load("local"); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("Load = %v, want ErrNoCredentials", err)
+	}
+}
+
+func TestSaveOverwritesSameProfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store := CredentialStore{Path: path}
+
+	if err := store.Save("local", Credentials{AccessToken: "old-acc", RefreshToken: "old-ref"}); err != nil {
+		t.Fatal(err)
+	}
+	// This is the path exercised on every token refresh, not just login.
+	want := Credentials{AccessToken: "new-acc", RefreshToken: "new-ref"}
+	if err := store.Save("local", want); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("Load = %+v, want %+v", got, want)
+	}
+}
+
+func TestSaveOnNullFileDoesNotPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	// json.MarshalIndent of a nil map produces exactly this, and this store's
+	// own Save can therefore write the input that used to crash its own
+	// readAll/Save round trip via a nil-map assignment panic.
+	if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := CredentialStore{Path: path}
+
+	want := Credentials{AccessToken: "acc-1"}
+	if err := store.Save("local", want); err != nil {
+		t.Fatalf("Save returned %v, want nil (and no panic)", err)
+	}
+
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatalf("Load returned %v", err)
+	}
+	if got != want {
+		t.Errorf("Load = %+v, want %+v", got, want)
+	}
+}
+
+func TestSaveRecoversFromCorruptFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	if err := os.WriteFile(path, []byte(`{"local": {"access_tok`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := CredentialStore{Path: path}
+
+	want := Credentials{AccessToken: "fresh-acc"}
+	if err := store.Save("local", want); err != nil {
+		t.Fatalf("Save returned %v, want nil", err)
+	}
+
+	if _, err := os.Stat(path + ".corrupt"); err != nil {
+		t.Errorf("quarantined file %s.corrupt not found: %v", path, err)
+	}
+
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatalf("Load returned %v", err)
+	}
+	if got != want {
+		t.Errorf("Load = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadOnCorruptFileErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	if err := os.WriteFile(path, []byte(`{"local": {"access_tok`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := CredentialStore{Path: path}
+
+	_, err := store.Load("local")
+	if err == nil {
+		t.Fatal("Load on a corrupt file returned nil error, want error")
+	}
+	if errors.Is(err, ErrNoCredentials) {
+		t.Errorf("Load on a corrupt file = %v, want it NOT to be ErrNoCredentials", err)
+	}
+	if !strings.Contains(err.Error(), "wi login") {
+		t.Errorf("error = %q, want it to name the remedy (`wi login`)", err.Error())
+	}
+}
+
+func TestFailedSaveLeavesExistingFileIntact(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permission bits, so this write-protection test cannot fail the way it needs to")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credentials.json")
+	store := CredentialStore{Path: path}
+
+	if err := store.Save("local", Credentials{AccessToken: "original"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	if err := store.Save("local", Credentials{AccessToken: "should-not-land"}); err == nil {
+		t.Fatal("Save into a read-only directory returned nil error, want error")
+	}
+
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatalf("Load returned %v", err)
+	}
+	if got.AccessToken != "original" {
+		t.Errorf("AccessToken = %q, want unchanged %q", got.AccessToken, "original")
+	}
+}
 ```
 
 NOTE: this uses `errors.Is`, not `err != ErrNoCredentials` — sentinel comparison
 by `!=` breaks the moment anyone wraps the error; `errors.Is` is the correct
 idiom and costs nothing.
+
+The six tests after `TestLoadMissingProfileReturnsErrNoCredentials` were added
+in a follow-up round after code review found two bugs empirically (see the
+Step 6 addendum below): a panic on a `null` file, and a corrupt file that
+locked `Save` out of recovering. They are shown here, in place, so this block
+stays in sync with the shipped test file rather than drifting into a stale
+historical snapshot.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -744,6 +891,11 @@ import (
 
 // ErrNoCredentials means the profile has never been logged in to.
 var ErrNoCredentials = errors.New("no stored credentials for profile")
+
+// errCorruptStore marks a readAll failure as unparsable JSON, as opposed to
+// an I/O error, so Save can tell the two apart: a corrupt file is something
+// Save can quarantine and recover from, an I/O error is not.
+var errCorruptStore = errors.New("credentials file is corrupt")
 
 // Credentials is one profile's stored token pair.
 type Credentials struct {
@@ -770,6 +922,11 @@ func DefaultCredentialStore() (CredentialStore, error) {
 	return CredentialStore{Path: filepath.Join(dir, "credentials.json")}, nil
 }
 
+// readAll returns every profile's credentials from disk, or an empty
+// (never nil) map if the file does not exist. A parse failure is wrapped in
+// errCorruptStore, naming the remedy, so callers can tell "file is malformed"
+// apart from other I/O errors and react differently — Save quarantines and
+// recovers, Load reports the failure as-is.
 func (s CredentialStore) readAll() (map[string]Credentials, error) {
 	data, err := os.ReadFile(s.Path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -780,12 +937,23 @@ func (s CredentialStore) readAll() (map[string]Credentials, error) {
 	}
 	all := map[string]Credentials{}
 	if err := json.Unmarshal(data, &all); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", s.Path, err)
+		return nil, fmt.Errorf("parsing %s: %w (delete this file or run `wi login` to reset stored logins): %w", s.Path, errCorruptStore, err)
+	}
+	// A file containing literal `null` unmarshals to a nil map with no error,
+	// and writing to a nil map panics. Normalize so every non-error return is
+	// a usable map — json.MarshalIndent of a nil map emits exactly "null", so
+	// this store can otherwise generate the input that crashes it.
+	if all == nil {
+		all = map[string]Credentials{}
 	}
 	return all, nil
 }
 
 // Load returns the profile's credentials, or ErrNoCredentials.
+//
+// A corrupt file is reported as-is rather than folded into ErrNoCredentials:
+// masking corruption as "never logged in" would send the user chasing the
+// wrong problem, and errors.Is(err, ErrNoCredentials) is false for it.
 func (s CredentialStore) Load(profile string) (Credentials, error) {
 	all, err := s.readAll()
 	if err != nil {
@@ -798,20 +966,56 @@ func (s CredentialStore) Load(profile string) (Credentials, error) {
 	return c, nil
 }
 
+// sweepStaleTemp best-effort removes leftover credentials-*.tmp files from a
+// prior Save that was killed (e.g. SIGKILL) before its deferred os.Remove
+// could run. Each holds a refresh token valid for 14 days; they're 0600 so
+// not a disclosure risk, but they'd otherwise accumulate invisibly. Errors
+// are ignored — a failed sweep must never fail the save it's cleaning up
+// after.
+func (s CredentialStore) sweepStaleTemp() {
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(s.Path), "credentials-*.tmp"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
+}
+
 // Save writes the profile's credentials, preserving other profiles.
 //
 // The write is synced to disk and made atomic (temp file plus rename) so an
 // interrupted save cannot leave a truncated or zero-length file that locks
-// the user out of every profile at once.
+// the user out of every profile at once. This does not make the save fully
+// durable: after a power loss the rename itself may not have landed, in
+// which case the file's previous contents come back — costing a re-login,
+// which is proportionate for a file that is entirely re-derivable that way.
 //
 // Save is read-modify-write with no locking: two `wi` processes refreshing
 // tokens in different terminals at the same moment can clobber each other's
 // profile entry. That is tolerated rather than fixed here, since the file is
 // re-derivable at any time by logging in again — last-writer-wins costs at
 // most a re-login, not data loss.
+//
+// A file that fails to parse is quarantined (renamed to Path+".corrupt",
+// keeping it around for forensics) rather than left blocking every future
+// save: the natural recovery path, `wi login`, goes through Save, so Save
+// has to be able to recover from corruption Load can only report.
+//
+// Save replaces whatever is at Path via atomic rename; if Path is a symlink,
+// the rename replaces the symlink itself with a regular file rather than
+// writing through it, so symlinking this file into a dotfiles repo will stop
+// tracking new tokens after the first save.
 func (s CredentialStore) Save(profile string, c Credentials) error {
+	s.sweepStaleTemp()
+
 	all, err := s.readAll()
-	if err != nil {
+	if errors.Is(err, errCorruptStore) {
+		if rerr := os.Rename(s.Path, s.Path+".corrupt"); rerr != nil {
+			return fmt.Errorf("quarantining corrupt credentials file: %w", rerr)
+		}
+		all = map[string]Credentials{}
+	} else if err != nil {
 		return err
 	}
 	all[profile] = c
@@ -822,6 +1026,8 @@ func (s CredentialStore) Save(profile string, c Credentials) error {
 	}
 
 	dir := filepath.Dir(s.Path)
+	// 0700 applies only when this call actually creates the directory; a
+	// pre-existing directory keeps whatever mode it already had.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
@@ -833,6 +1039,11 @@ func (s CredentialStore) Save(profile string, c Credentials) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
+	// os.CreateTemp's requested 0600 is masked by the process umask like any
+	// other open(2): under a restrictive umask such as 0200 the file would
+	// come out 0400 without this Chmod, silently failing
+	// TestCredentialFileIsNotWorldReadable's exact-0600 assertion on some
+	// machines and not others. This call is load-bearing, not belt-and-braces.
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
 		return fmt.Errorf("securing temp credentials file: %w", err)
@@ -865,6 +1076,40 @@ Expected: PASS.
 ```bash
 git add internal/cli/config/credentials.go internal/cli/config/credentials_test.go
 git commit -m "feat(cli): 0600 per-profile credential store with atomic writes"
+```
+
+- [ ] **Step 6: Post-review hardening**
+
+A code review of the Step 5 commit empirically confirmed two bugs in
+`readAll`'s contract, both fixed above and covered by the tests added in
+Step 1:
+
+- `json.Unmarshal([]byte("null"), &all)` sets `all` to `nil` with no error.
+  `Save` then panicked on `all[profile] = c` — assignment to a nil map. Since
+  `json.MarshalIndent` of a nil map writes exactly `"null"`, the store could
+  generate the input that crashed its own decoder. `readAll` now normalizes a
+  nil result to an empty map.
+- A truncated or 0-byte `credentials.json` (a plausible outcome of a full
+  disk or a non-atomic writer elsewhere) failed both `Load` and `Save` with
+  the same parse error — including `Save`, so the natural recovery path
+  (`wi login`) could not repair the file. `readAll` now wraps parse failures
+  in the unexported `errCorruptStore` sentinel; `Save` quarantines the file to
+  `Path+".corrupt"` and continues with an empty map, while `Load` still
+  reports the failure, with the message naming the remedy.
+
+Also: a sweep of stale `credentials-*.tmp` files (left behind if a prior
+`Save` was killed before its deferred cleanup ran) at the top of `Save`; a
+corrected comment on the temp file's `Chmod(0o600)` explaining it normalizes
+against the process umask rather than being redundant; and doc-comment notes
+on `Save` about its symlink-replacement behavior and about power-loss
+durability.
+
+Run: `go test ./internal/cli/config/ -v && go test ./internal/cli/config/ -race`
+Expected: PASS.
+
+```bash
+git add internal/cli/config/credentials.go internal/cli/config/credentials_test.go
+git commit -m "fix(cli): make credential store recoverable from a corrupt file"
 ```
 
 ### Task 4: Base HTTP client and typed errors
