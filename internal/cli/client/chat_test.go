@@ -28,15 +28,15 @@ func TestListChatsUnwrapsPaginationEnvelope(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 2 {
-		t.Fatalf("len(chats) = %d, want 2", len(chats))
+	if len(page.Results) != 2 {
+		t.Fatalf("len(page.Results) = %d, want 2", len(page.Results))
 	}
-	if chats[0].Name != "deploy plan" {
-		t.Errorf("chats[0].Name = %q, want deploy plan", chats[0].Name)
+	if page.Results[0].Name != "deploy plan" {
+		t.Errorf("page.Results[0].Name = %q, want deploy plan", page.Results[0].Name)
 	}
 }
 
@@ -123,15 +123,46 @@ func TestListChatsRefreshesExpiredToken(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 1 || chats[0].Name != "deploy plan" {
-		t.Fatalf("chats = %+v, want one chat named deploy plan", chats)
+	if len(page.Results) != 1 || page.Results[0].Name != "deploy plan" {
+		t.Fatalf("page.Results = %+v, want one chat named deploy plan", page.Results)
 	}
 	if got := atomic.LoadInt32(&chatCalls); got != 2 {
 		t.Errorf("/chat called %d times, want 2 (one 401, one retry after refresh)", got)
+	}
+}
+
+// TestListChatsDecodesTotalCount is the regression test for the whole point
+// of ChatPage: total_count can exceed len(results) once a listing is capped
+// by Limit, and a caller needs that number to say "showing 2 of 347" rather
+// than presenting a truncated list that looks like the account only has 2
+// chats.
+func TestListChatsDecodesTotalCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{
+			"results": [
+				{"name": "deploy plan"},
+				{"name": "rust notes"}
+			],
+			"total_count": 347,
+			"page": 1
+		}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(page.Results) != 2 {
+		t.Fatalf("len(page.Results) = %d, want 2", len(page.Results))
+	}
+	if page.TotalCount != 347 {
+		t.Errorf("page.TotalCount = %d, want 347", page.TotalCount)
 	}
 }
 
@@ -145,12 +176,12 @@ func TestListChatsEmptyResults(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 0 {
-		t.Errorf("len(chats) = %d, want 0", len(chats))
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
 	}
 }
 
@@ -165,11 +196,32 @@ func TestListChatsMissingResultsField(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 0 {
-		t.Errorf("len(chats) = %d, want 0", len(chats))
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
+	}
+}
+
+// TestListChatsNullResultsField pins a third wire shape for "no chats":
+// "results" present but explicitly JSON null, rather than omitted or an
+// empty array. encoding/json treats a null field the same as an absent one
+// for a slice, but that equivalence is exactly the kind of thing worth
+// pinning rather than assuming.
+func TestListChatsNullResultsField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":null,"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
 	}
 }

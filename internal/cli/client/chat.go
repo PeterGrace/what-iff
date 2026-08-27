@@ -17,18 +17,25 @@ type ListChatsOptions struct {
 	Limit    int
 }
 
-// chatPage is the server's pagination envelope specialized to chats. The shared
-// models.PaginatedResponse uses []any, which would force a second decode pass.
-type chatPage struct {
+// ChatPage is one page of a chat listing.
+//
+// TotalCount is returned alongside the results because a listing is capped by
+// the caller's limit: without it, a command showing 100 of 347 chats has no way
+// to say so, and a truncated list is indistinguishable from missing data.
+//
+// The server's envelope also carries a page number, but nothing here consumes
+// it yet, so it is deliberately left undecoded rather than kept as dead
+// weight — it can come back once pagination actually lands and something
+// reads it.
+type ChatPage struct {
 	Results    []models.Chat `json:"results"`
 	TotalCount int           `json:"total_count"`
-	Page       int           `json:"page"`
 }
 
-// ListChats returns the user's chats. It calls do, not doJSON, so an expired
-// access token refreshes transparently — the same guarantee every other
-// resource call in this package gets.
-func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models.Chat, error) {
+// ListChats returns one page of the user's chats. It calls do, not doJSON, so
+// an expired access token refreshes transparently — the same guarantee every
+// other resource call in this package gets.
+func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) (ChatPage, error) {
 	q := url.Values{}
 	if opts.Archived {
 		q.Set("archived", "true")
@@ -50,9 +57,9 @@ func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models
 		path += "?" + encoded
 	}
 
-	var page chatPage
+	var page ChatPage
 	if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
-		return nil, err
+		return ChatPage{}, err
 	}
-	return page.Results, nil
+	return page, nil
 }

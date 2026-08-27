@@ -3383,12 +3383,33 @@ value's actual wire behavior so the split doesn't quietly erode later.
 
 #### Why both an empty and a missing `results` field are tested
 
-`chatPage.Results` is `[]models.Chat`, and `encoding/json` leaves a struct
-field at its zero value when the field is absent from the payload — a nil
-slice, not a decode error. `TestListChatsEmptyResults` and
-`TestListChatsMissingResultsField` pin both of the server's two ways of
-saying "no chats" (`"results":[]` vs. omitting `results` outright) so a
-caller ranging over the returned slice never has to special-case either one.
+`ChatPage.Results` is `[]models.Chat`, and `encoding/json` leaves a struct
+field at its zero value when the field is absent from the payload, or
+explicitly `null` — a nil slice, not a decode error. `TestListChatsEmptyResults`,
+`TestListChatsMissingResultsField`, and `TestListChatsNullResultsField` pin
+all three of the server's ways of saying "no chats" (`"results":[]`,
+omitting `results` outright, and `"results":null`) so a caller ranging over
+the returned slice never has to special-case any of them.
+
+#### Why `ListChats` returns a `ChatPage`, not just `[]models.Chat`
+
+The first version of this method returned `page.Results` directly and
+dropped `total_count` on the floor — the pagination envelope was decoded and
+then thrown away three lines later. That's the same "looks like missing
+data" failure the `Limit`-omission comment above exists to prevent, just
+relocated one layer up: with `total_count: 347` on the wire and `Limit: 100`,
+a caller gets 100 chats back and no way to learn there were 347 — a
+truncated listing that's indistinguishable from an account that only has
+100 chats. `ChatPage` surfaces `TotalCount` alongside `Results` specifically
+so `wi chats` (Task 10) can say "showing 100 of 347" instead of silently
+lying by omission. `TestListChatsDecodesTotalCount` pins this with a
+response where `total_count` exceeds `len(results)`.
+
+The envelope's `page` number is dropped rather than carried onto `ChatPage`:
+nothing in this package or its only planned caller reads it yet, and an
+unread field is exactly the kind of dead weight this correction exists to
+avoid reintroducing. It can come back once pagination auto-follow or a
+page-aware command actually consumes it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3423,15 +3444,15 @@ func TestListChatsUnwrapsPaginationEnvelope(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 2 {
-		t.Fatalf("len(chats) = %d, want 2", len(chats))
+	if len(page.Results) != 2 {
+		t.Fatalf("len(page.Results) = %d, want 2", len(page.Results))
 	}
-	if chats[0].Name != "deploy plan" {
-		t.Errorf("chats[0].Name = %q, want deploy plan", chats[0].Name)
+	if page.Results[0].Name != "deploy plan" {
+		t.Errorf("page.Results[0].Name = %q, want deploy plan", page.Results[0].Name)
 	}
 }
 
@@ -3518,15 +3539,46 @@ func TestListChatsRefreshesExpiredToken(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 1 || chats[0].Name != "deploy plan" {
-		t.Fatalf("chats = %+v, want one chat named deploy plan", chats)
+	if len(page.Results) != 1 || page.Results[0].Name != "deploy plan" {
+		t.Fatalf("page.Results = %+v, want one chat named deploy plan", page.Results)
 	}
 	if got := atomic.LoadInt32(&chatCalls); got != 2 {
 		t.Errorf("/chat called %d times, want 2 (one 401, one retry after refresh)", got)
+	}
+}
+
+// TestListChatsDecodesTotalCount is the regression test for the whole point
+// of ChatPage: total_count can exceed len(results) once a listing is capped
+// by Limit, and a caller needs that number to say "showing 2 of 347" rather
+// than presenting a truncated list that looks like the account only has 2
+// chats.
+func TestListChatsDecodesTotalCount(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{
+			"results": [
+				{"name": "deploy plan"},
+				{"name": "rust notes"}
+			],
+			"total_count": 347,
+			"page": 1
+		}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{Limit: 2})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(page.Results) != 2 {
+		t.Fatalf("len(page.Results) = %d, want 2", len(page.Results))
+	}
+	if page.TotalCount != 347 {
+		t.Errorf("page.TotalCount = %d, want 347", page.TotalCount)
 	}
 }
 
@@ -3540,12 +3592,12 @@ func TestListChatsEmptyResults(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 0 {
-		t.Errorf("len(chats) = %d, want 0", len(chats))
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
 	}
 }
 
@@ -3560,12 +3612,33 @@ func TestListChatsMissingResultsField(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
 	if err != nil {
 		t.Fatalf("ListChats returned %v", err)
 	}
-	if len(chats) != 0 {
-		t.Errorf("len(chats) = %d, want 0", len(chats))
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
+	}
+}
+
+// TestListChatsNullResultsField pins a third wire shape for "no chats":
+// "results" present but explicitly JSON null, rather than omitted or an
+// empty array. encoding/json treats a null field the same as an absent one
+// for a slice, but that equivalence is exactly the kind of thing worth
+// pinning rather than assuming.
+func TestListChatsNullResultsField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":null,"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	page, err := c.ListChats(context.Background(), ListChatsOptions{})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(page.Results) != 0 {
+		t.Errorf("len(page.Results) = %d, want 0", len(page.Results))
 	}
 }
 ```
@@ -3597,18 +3670,25 @@ type ListChatsOptions struct {
 	Limit    int
 }
 
-// chatPage is the server's pagination envelope specialized to chats. The shared
-// models.PaginatedResponse uses []any, which would force a second decode pass.
-type chatPage struct {
+// ChatPage is one page of a chat listing.
+//
+// TotalCount is returned alongside the results because a listing is capped by
+// the caller's limit: without it, a command showing 100 of 347 chats has no way
+// to say so, and a truncated list is indistinguishable from missing data.
+//
+// The server's envelope also carries a page number, but nothing here consumes
+// it yet, so it is deliberately left undecoded rather than kept as dead
+// weight — it can come back once pagination actually lands and something
+// reads it.
+type ChatPage struct {
 	Results    []models.Chat `json:"results"`
 	TotalCount int           `json:"total_count"`
-	Page       int           `json:"page"`
 }
 
-// ListChats returns the user's chats. It calls do, not doJSON, so an expired
-// access token refreshes transparently — the same guarantee every other
-// resource call in this package gets.
-func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models.Chat, error) {
+// ListChats returns one page of the user's chats. It calls do, not doJSON, so
+// an expired access token refreshes transparently — the same guarantee every
+// other resource call in this package gets.
+func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) (ChatPage, error) {
 	q := url.Values{}
 	if opts.Archived {
 		q.Set("archived", "true")
@@ -3630,11 +3710,11 @@ func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models
 		path += "?" + encoded
 	}
 
-	var page chatPage
+	var page ChatPage
 	if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
-		return nil, err
+		return ChatPage{}, err
 	}
-	return page.Results, nil
+	return page, nil
 }
 ```
 
