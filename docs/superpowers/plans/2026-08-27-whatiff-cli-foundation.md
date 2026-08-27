@@ -3355,6 +3355,41 @@ git commit -m "fix(cli): survive refresh panics and surface re-auth failures"
 - Create: `internal/cli/client/chat.go`
 - Test: `internal/cli/client/chat_test.go`
 
+#### Why `ListChats` calls `do`, not `doJSON`
+
+`ListChats` is the first (and, in this milestone, only) resource call in the
+package — everything before it was auth plumbing. It would be easy to reach
+for `doJSON` here since there's no obvious retry concern at the call site,
+but that would silently drop transparent re-auth from the one place a user
+actually feels it: an access token expiring mid-session while browsing
+chats. `TestListChatsRefreshesExpiredToken` pins this by 401'ing the first
+`/chat` request and succeeding only after the refreshed token appears on the
+retry, so swapping `do` for `doJSON` fails the test outright rather than
+just losing a property nothing checks.
+
+#### Why a zero `Limit` omits the query param instead of defaulting it
+
+The server's own default page size is 10
+(`internal/handlers/chat/chat.go`), which is easy to miss and easy to regress
+into: a listing that "just works" in casual testing (few chats) silently
+truncates once a user has more than 10. The fix isn't to have the client
+invent a bigger default, though — that would make `internal/cli/client` a
+place with presentation opinions instead of a thin transport. Task 10's `wi
+chats` command is where that policy belongs (it will pass an explicit
+`defaultChatLimit = 100`). `ListChats` only omits the param when
+`opts.Limit <= 0`, with a comment at the call site explaining that the
+omission is deliberate, and `TestListChatsZeroLimitOmitsParam` pins the zero
+value's actual wire behavior so the split doesn't quietly erode later.
+
+#### Why both an empty and a missing `results` field are tested
+
+`chatPage.Results` is `[]models.Chat`, and `encoding/json` leaves a struct
+field at its zero value when the field is absent from the payload — a nil
+slice, not a decode error. `TestListChatsEmptyResults` and
+`TestListChatsMissingResultsField` pin both of the server's two ways of
+saying "no chats" (`"results":[]` vs. omitting `results` outright) so a
+caller ranging over the returned slice never has to special-case either one.
+
 - [ ] **Step 1: Write the failing test**
 
 ```go
@@ -3364,6 +3399,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -3417,6 +3453,121 @@ func TestListChatsPassesArchivedAndSearch(t *testing.T) {
 		t.Fatalf("ListChats returned %v", err)
 	}
 }
+
+// TestListChatsPassesLimit pins the limit query param: the server's default
+// page size is 10 (internal/handlers/chat/chat.go), so a caller that asks
+// for more than that must have its Limit actually reach the server rather
+// than silently falling back to a truncated listing.
+func TestListChatsPassesLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("limit"); got != "100" {
+			t.Errorf("limit = %q, want 100", got)
+		}
+		w.Write([]byte(`{"results":[],"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	if _, err := c.ListChats(context.Background(), ListChatsOptions{Limit: 100}); err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+}
+
+// TestListChatsZeroLimitOmitsParam pins the deliberate choice, documented on
+// ListChatsOptions.Limit and ListChats, that a zero Limit sends no limit
+// param at all rather than inventing a client-side default — the caller
+// (the wi chats command, in the next task) owns that policy.
+func TestListChatsZeroLimitOmitsParam(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := r.URL.Query()["limit"]; ok {
+			t.Errorf("limit param present = %q, want it omitted for a zero Limit", r.URL.Query().Get("limit"))
+		}
+		w.Write([]byte(`{"results":[],"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	if _, err := c.ListChats(context.Background(), ListChatsOptions{}); err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+}
+
+// TestListChatsRefreshesExpiredToken pins ListChats going through do, not
+// doJSON. Without transparent re-auth, ListChats would be the one resource
+// call in this package that forces a user to re-run `wi login` the moment
+// their access token expires mid-session, instead of refreshing silently
+// like every other call.
+func TestListChatsRefreshesExpiredToken(t *testing.T) {
+	var chatCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/chat":
+			atomic.AddInt32(&chatCalls, 1)
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"results":[{"name":"deploy plan"}],"total_count":1,"page":1}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(chats) != 1 || chats[0].Name != "deploy plan" {
+		t.Fatalf("chats = %+v, want one chat named deploy plan", chats)
+	}
+	if got := atomic.LoadInt32(&chatCalls); got != 2 {
+		t.Errorf("/chat called %d times, want 2 (one 401, one retry after refresh)", got)
+	}
+}
+
+// TestListChatsEmptyResults pins the "no chats" case: an explicit empty
+// results array must decode to a nil/empty slice and no error, not a panic
+// or a spurious error from an all-zero envelope.
+func TestListChatsEmptyResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"results":[],"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(chats) != 0 {
+		t.Errorf("len(chats) = %d, want 0", len(chats))
+	}
+}
+
+// TestListChatsMissingResultsField pins the case where the server omits
+// "results" entirely rather than sending an empty array — a distinct wire
+// shape from TestListChatsEmptyResults that must decode the same way: a
+// nil/empty slice and no error, not a panic.
+func TestListChatsMissingResultsField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"total_count":0,"page":1}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	chats, err := c.ListChats(context.Background(), ListChatsOptions{})
+	if err != nil {
+		t.Fatalf("ListChats returned %v", err)
+	}
+	if len(chats) != 0 {
+		t.Errorf("len(chats) = %d, want 0", len(chats))
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -3454,7 +3605,9 @@ type chatPage struct {
 	Page       int           `json:"page"`
 }
 
-// ListChats returns the user's chats.
+// ListChats returns the user's chats. It calls do, not doJSON, so an expired
+// access token refreshes transparently — the same guarantee every other
+// resource call in this package gets.
 func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models.Chat, error) {
 	q := url.Values{}
 	if opts.Archived {
@@ -3463,6 +3616,11 @@ func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) ([]models
 	if opts.Search != "" {
 		q.Set("search", opts.Search)
 	}
+	// The server defaults to a page size of 10 when limit is omitted
+	// (internal/handlers/chat/chat.go). Leaving Limit <= 0 unset here is a
+	// deliberate choice, not an oversight: this package stays a thin
+	// transport, and it is the caller's job to decide what "list chats"
+	// should default to (the wi chats command passes an explicit limit).
 	if opts.Limit > 0 {
 		q.Set("limit", strconv.Itoa(opts.Limit))
 	}
