@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -105,7 +106,7 @@ func TestLoadMissingFileIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve returned %v", err)
 	}
-	if p.APIURL != DefaultAPIURL {
+	if p.APIURL != "http://localhost:8080/api" {
 		t.Errorf("APIURL = %q, want the builtin default", p.APIURL)
 	}
 }
@@ -118,5 +119,124 @@ func TestLoadMalformedTOMLErrors(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load on malformed TOML returned nil error, want error")
+	}
+}
+
+func TestResolveErrorsOnProfileWithNoAPIURL(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"hosted": {Model: "gpt-5"},
+		},
+	}
+	_, _, err := cfg.Resolve("hosted")
+	if err == nil {
+		t.Fatal("Resolve(\"hosted\") = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "api_url") {
+		t.Errorf("error = %q, want it to mention api_url", err.Error())
+	}
+}
+
+func TestResolveAllowsLocalProfileWithNoAPIURL(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"local": {Model: "gpt-5"},
+		},
+	}
+	name, p, err := cfg.Resolve("local")
+	if err != nil {
+		t.Fatalf("Resolve(\"local\") returned %v", err)
+	}
+	if name != "local" {
+		t.Errorf("resolved name = %q, want local", name)
+	}
+	if p.APIURL != "http://localhost:8080/api" {
+		t.Errorf("APIURL = %q, want the builtin local default", p.APIURL)
+	}
+	if p.Model != "gpt-5" {
+		t.Errorf("Model = %q, want gpt-5", p.Model)
+	}
+}
+
+func TestResolveRejectsAPIURLWithoutScheme(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"hosted": {APIURL: "whatiff.chat/api"},
+		},
+	}
+	if _, _, err := cfg.Resolve("hosted"); err == nil {
+		t.Fatal("Resolve(\"hosted\") = nil error, want error")
+	}
+}
+
+func TestResolveErrorListsAvailableProfiles(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"local":  {APIURL: "http://localhost:8080/api"},
+			"hosted": {APIURL: "https://whatiff.chat/api"},
+		},
+	}
+	_, _, err := cfg.Resolve("nope")
+	if err == nil {
+		t.Fatal("Resolve(\"nope\") = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "local") || !strings.Contains(err.Error(), "hosted") {
+		t.Errorf("error = %q, want it to list both profile names", err.Error())
+	}
+}
+
+func TestResolveNoDefaultProfileErrorIsSpecific(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"hosted": {APIURL: "https://whatiff.chat/api"},
+		},
+	}
+	_, _, err := cfg.Resolve("")
+	if err == nil {
+		t.Fatal("Resolve(\"\") = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "default_profile") {
+		t.Errorf("error = %q, want it to mention default_profile", err.Error())
+	}
+}
+
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `defaultprofile = "hosted"`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load returned nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "defaultprofile") {
+		t.Errorf("error = %q, want it to name the offending key", err.Error())
+	}
+}
+
+func TestResolveDoesNotMutateConfig(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"local": {},
+		},
+	}
+	if _, _, err := cfg.Resolve("local"); err != nil {
+		t.Fatalf("Resolve(\"local\") returned %v", err)
+	}
+	if cfg.Profiles["local"].APIURL != "" {
+		t.Errorf("cfg.Profiles[\"local\"].APIURL = %q, want unchanged empty string", cfg.Profiles["local"].APIURL)
+	}
+}
+
+func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
+	path, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath returned %v", err)
+	}
+	want := filepath.Join("whatiff", "config.toml")
+	if !strings.HasSuffix(path, want) {
+		t.Errorf("DefaultPath() = %q, want suffix %q", path, want)
 	}
 }
