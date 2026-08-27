@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ErrNoCredentials means the profile has never been logged in to.
@@ -15,6 +16,13 @@ var ErrNoCredentials = errors.New("no stored credentials for profile")
 // an I/O error, so Save can tell the two apart: a corrupt file is something
 // Save can quarantine and recover from, an I/O error is not.
 var errCorruptStore = errors.New("credentials file is corrupt")
+
+// staleTempAge is how old a leftover temp file must be before Save removes it.
+// A temp file belonging to an in-flight Save is milliseconds old, so the
+// generous threshold is what keeps cleanup from unlinking a concurrent
+// writer's file out from under it — the rename would then fail with ENOENT
+// after its write, sync, and close had all succeeded.
+const staleTempAge = time.Hour
 
 // Credentials is one profile's stored token pair.
 type Credentials struct {
@@ -56,7 +64,7 @@ func (s CredentialStore) readAll() (map[string]Credentials, error) {
 	}
 	all := map[string]Credentials{}
 	if err := json.Unmarshal(data, &all); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w (delete this file or run `wi login` to reset stored logins): %w", s.Path, errCorruptStore, err)
+		return nil, fmt.Errorf("parsing %s: %w: %w (delete this file or run `wi login` to reset stored logins)", s.Path, errCorruptStore, err)
 	}
 	// A file containing literal `null` unmarshals to a nil map with no error,
 	// and writing to a nil map panics. Normalize so every non-error return is
@@ -85,18 +93,24 @@ func (s CredentialStore) Load(profile string) (Credentials, error) {
 	return c, nil
 }
 
-// sweepStaleTemp best-effort removes leftover credentials-*.tmp files from a
-// prior Save that was killed (e.g. SIGKILL) before its deferred os.Remove
-// could run. Each holds a refresh token valid for 14 days; they're 0600 so
-// not a disclosure risk, but they'd otherwise accumulate invisibly. Errors
-// are ignored — a failed sweep must never fail the save it's cleaning up
-// after.
+// sweepStaleTemp best-effort removes credentials-*.tmp files older than
+// staleTempAge from a prior Save that was killed (e.g. SIGKILL) before its
+// deferred os.Remove could run. Each holds a refresh token valid for 14 days;
+// they're 0600 so not a disclosure risk, but they'd otherwise accumulate
+// invisibly. The age check is what keeps this from unlinking a concurrent
+// Save's in-flight temp file out from under it. Errors — from the glob, from
+// stat, from the remove itself — are ignored: a failed sweep must never fail
+// the save it's cleaning up after.
 func (s CredentialStore) sweepStaleTemp() {
 	matches, err := filepath.Glob(filepath.Join(filepath.Dir(s.Path), "credentials-*.tmp"))
 	if err != nil {
 		return
 	}
 	for _, m := range matches {
+		fi, err := os.Stat(m)
+		if err != nil || time.Since(fi.ModTime()) < staleTempAge {
+			continue
+		}
 		_ = os.Remove(m)
 	}
 }
@@ -117,7 +131,8 @@ func (s CredentialStore) sweepStaleTemp() {
 // most a re-login, not data loss.
 //
 // A file that fails to parse is quarantined (renamed to Path+".corrupt",
-// keeping it around for forensics) rather than left blocking every future
+// keeping the most recent such file around for forensics — a second
+// corruption overwrites the first) rather than left blocking every future
 // save: the natural recovery path, `wi login`, goes through Save, so Save
 // has to be able to recover from corruption Load can only report.
 //

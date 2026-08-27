@@ -2,10 +2,13 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestCredentialRoundTrip(t *testing.T) {
@@ -205,5 +208,68 @@ func TestFailedSaveLeavesExistingFileIntact(t *testing.T) {
 	}
 	if got.AccessToken != "original" {
 		t.Errorf("AccessToken = %q, want unchanged %q", got.AccessToken, "original")
+	}
+}
+
+func TestSaveSweepsOnlyStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credentials.json")
+	store := CredentialStore{Path: path}
+
+	if err := store.Save("local", Credentials{AccessToken: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh temp file looks like an in-flight Save's own file and must
+	// survive the sweep; a stale one looks like leftovers from a killed
+	// Save and must be removed.
+	freshTmp := filepath.Join(dir, "credentials-fresh.tmp")
+	if err := os.WriteFile(freshTmp, []byte("in flight"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staleTmp := filepath.Join(dir, "credentials-stale.tmp")
+	if err := os.WriteFile(staleTmp, []byte("leftover"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * staleTempAge)
+	if err := os.Chtimes(staleTmp, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Save("local", Credentials{AccessToken: "acc-2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(freshTmp); err != nil {
+		t.Errorf("fresh temp file was removed by the sweep: %v", err)
+	}
+	if _, err := os.Stat(staleTmp); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale temp file still exists (stat err = %v), want it swept", err)
+	}
+}
+
+func TestSaveConcurrentSavesAllSucceed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store := CredentialStore{Path: path}
+
+	// Regression test for a sweep that unlinked a concurrent Save's own
+	// in-flight temp file out from under it: the reviewer measured 7/50
+	// concurrent Saves failing before the staleness check was added.
+	const n = 30
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = store.Save("local", Credentials{AccessToken: fmt.Sprintf("acc-%d", i)})
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Save #%d returned %v, want nil", i, err)
+		}
 	}
 }
