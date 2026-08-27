@@ -6,7 +6,14 @@
 // time it switches.
 package config
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/BurntSushi/toml"
+)
 
 // DefaultProfileName is used when the config file names no default.
 const DefaultProfileName = "local"
@@ -54,4 +61,40 @@ func (c Config) Resolve(name string) (string, Profile, error) {
 		return name, Profile{APIURL: DefaultAPIURL}, nil
 	}
 	return "", Profile{}, fmt.Errorf("no profile named %q in config", name)
+}
+
+// Load reads a config file. A missing file is not an error: the CLI is usable
+// with no configuration at all, against a local server.
+func Load(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cfg, nil
+	}
+	if err != nil {
+		return cfg, fmt.Errorf("reading %s: %w", path, err)
+	}
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Dir is the CLI's configuration directory, honoring XDG_CONFIG_HOME through
+// os.UserConfigDir.
+func Dir() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("locating user config dir: %w", err)
+	}
+	return filepath.Join(base, "whatiff"), nil
+}
+
+// DefaultPath is the standard location of config.toml.
+func DefaultPath() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "config.toml"), nil
 }
