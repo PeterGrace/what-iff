@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestDoJSONDecodesSuccess(t *testing.T) {
@@ -116,11 +118,16 @@ func TestDoJSONSendsBodyAndContentType(t *testing.T) {
 // effect rather than its mechanism: a client that fails to fully read a
 // response body before returning forces net/http to close the connection
 // instead of reusing it, so a dropped drain shows up here as more than one
-// connection across repeated calls to the same server.
+// connection across repeated calls to the same server. The body must be
+// large — a small body (tens of bytes) still fits in the connection's read
+// buffer and gets reused even when nothing explicitly drains it, so the
+// mutation this test exists to catch would silently survive.
 func TestDoJSONNilOutDiscardsBody(t *testing.T) {
+	big := bytes.Repeat([]byte("x"), 300<<10) // large enough that an undrained body prevents reuse
+
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"name":"deploy plan"}`))
+		w.Write(big)
 	}))
 	var newConns atomic.Int32
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -378,5 +385,197 @@ func TestDoJSONUnrecognizedJSONErrorBodyIncludesSnippet(t *testing.T) {
 	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "upstream refused") {
 		t.Fatalf("error = %v, want it to include the response body snippet", err)
+	}
+}
+
+// TestSnippetStripsTerminalControlSequences pins the security-relevant half
+// of snippet: raw is untrusted, server-controlled bytes that end up printed
+// straight to the user's terminal, so control sequences (ANSI/OSC escapes,
+// BEL, backspace, NUL) must not survive into APIError.Snippet. Each case is
+// something a hostile or compromised server could send to clear the screen,
+// forge fake-looking output, or rename the terminal tab.
+func TestSnippetStripsTerminalControlSequences(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "ansi color codes and clear screen",
+			body: "\x1b[31mFAKE ERROR\x1b[0m\x1b[2J",
+			want: "[31mFAKE ERROR[0m[2J",
+		},
+		{
+			name: "osc sequence sets terminal title",
+			body: "\x1b]0;pwned\x07rest",
+			want: "]0;pwnedrest",
+		},
+		{
+			name: "nul byte",
+			body: "before\x00after",
+			want: "beforeafter",
+		},
+		{
+			name: "bell and backspace",
+			body: "alert\x07\x08\x08x",
+			want: "alertx",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			c := New(srv.URL, Tokens{Access: "acc-1"})
+			err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error = %v, want *APIError", err)
+			}
+			if apiErr.Snippet != tt.want {
+				t.Errorf("Snippet = %q, want %q", apiErr.Snippet, tt.want)
+			}
+			for _, r := range apiErr.Snippet {
+				if !unicode.IsPrint(r) {
+					t.Errorf("Snippet %q contains non-printable rune %U", apiErr.Snippet, r)
+				}
+			}
+		})
+	}
+}
+
+func TestSnippetCollapsesWhitespace(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("line1\n\n\tline2   line3"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Snippet != "line1 line2 line3" {
+		t.Errorf("Snippet = %q, want whitespace collapsed to single spaces", apiErr.Snippet)
+	}
+}
+
+func TestSnippetTruncatesLongBodies(t *testing.T) {
+	body := strings.Repeat("a", 250)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	want := strings.Repeat("a", 200) + "…"
+	if apiErr.Snippet != want {
+		t.Errorf("Snippet = %q, want 200 a's plus an ellipsis", apiErr.Snippet)
+	}
+}
+
+// TestSnippetTruncatesByRuneNotByte uses a 3-byte-per-rune character so that
+// a byte-indexed cap (instead of the intended rune-indexed one) lands
+// mid-character at the 200-rune boundary and produces invalid UTF-8 — 200 is
+// not a multiple of 3, so the misalignment is guaranteed rather than
+// incidental.
+func TestSnippetTruncatesByRuneNotByte(t *testing.T) {
+	multibyte := strings.Repeat("中", 500)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(multibyte))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if !utf8.ValidString(apiErr.Snippet) {
+		t.Fatalf("Snippet = %q is not valid UTF-8", apiErr.Snippet)
+	}
+	want := strings.Repeat("中", 200) + "…"
+	if apiErr.Snippet != want {
+		t.Errorf("Snippet = %q, want 200 runes of 中 plus an ellipsis", apiErr.Snippet)
+	}
+}
+
+// TestDoJSONSuccessValidJSONWrongShapeIsNotMisreportedAsNonJSON pins
+// looksLikeJSON's actual job: telling "not JSON at all" apart from "JSON
+// that doesn't match our struct". A response that is valid JSON but the
+// wrong shape must not be reported with the not-JSON hint.
+func TestDoJSONSuccessValidJSONWrongShapeIsNotMisreportedAsNonJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"name":123}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	var out struct {
+		Name string `json:"name"`
+	}
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, &out)
+	if err == nil {
+		t.Fatal("doJSON returned nil error for JSON that doesn't match the target struct")
+	}
+	if strings.Contains(err.Error(), "not JSON") {
+		t.Errorf("error = %q, want it not to claim the response wasn't JSON", err.Error())
+	}
+}
+
+func TestDoJSONSuccessEmptyBodyReportsWithoutDanglingColon(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	var out struct {
+		Name string `json:"name"`
+	}
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, &out)
+	if err == nil {
+		t.Fatal("doJSON returned nil error for an empty 200 body")
+	}
+	if strings.Contains(err.Error(), ": :") {
+		t.Errorf("error = %q, want no dangling colon for an empty snippet", err.Error())
+	}
+	if !strings.Contains(err.Error(), "empty response body") {
+		t.Errorf("error = %q, want an explicit empty-body hint", err.Error())
+	}
+}
+
+// TestClientWithoutNewFallsBackToDefaultHTTPClient pins httpClient's nil
+// fallback: both Client fields it takes to build one this way are exported,
+// so this compiles and must work rather than nil-panic on c.HTTP.Do.
+func TestClientWithoutNewFallsBackToDefaultHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL}
+	if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
+		t.Fatalf("doJSON returned %v, want a struct-literal Client to work without New", err)
 	}
 }

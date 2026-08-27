@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
@@ -23,6 +24,15 @@ import (
 // in APIError.Snippet: enough to recognize a captive portal or proxy page,
 // short enough not to dump a full HTML document into a terminal.
 const maxErrorBodySnippet = 200
+
+// maxSuccessBody caps how much of a 2xx response doJSON will read before
+// decoding. A JSON API response is orders of magnitude smaller than this; the
+// cap exists only to bound how much memory a broken or hostile server —
+// answering 200 with an unbounded or infinite stream — can force the CLI to
+// allocate. The error path has its own, much smaller cap for the same reason
+// (see decodeAPIError); this one is larger because a legitimate success body
+// can legitimately be sizable (a chat history, say).
+const maxSuccessBody = 32 << 20 // 32MB
 
 // APIError is a non-2xx response. Message is the server's own wording, which
 // the CLI surfaces verbatim rather than inventing its own.
@@ -114,6 +124,10 @@ func (c *Client) httpClient() *http.Client {
 
 // doJSON performs one request with no refresh handling. Callers that need
 // transparent re-auth use do (added in the next task).
+//
+// doJSON JSON-unmarshals the entire response body, so it cannot be used for a
+// large binary payload such as milestone 5's image downloads — those need a
+// separate streaming method.
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
 	var reader io.Reader
 	if body != nil {
@@ -163,13 +177,17 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 	// also lets a decode failure be diagnosed against the raw bytes — a
 	// captive portal's HTML page otherwise decodes as a bare JSON syntax
 	// error with no hint that HTML came back at all.
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSuccessBody))
 	if err != nil {
 		return fmt.Errorf("reading %s %s response: %w", method, path, err)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		if !looksLikeJSON(raw) {
-			return fmt.Errorf("%s %s: response was not JSON: %s: %w", method, path, snippet(raw), err)
+			snip := snippet(raw)
+			if snip == "" {
+				snip = "empty response body"
+			}
+			return fmt.Errorf("%s %s: response was not JSON: %s: %w", method, path, snip, err)
 		}
 		return fmt.Errorf("decoding %s %s response: %w", method, path, err)
 	}
@@ -215,11 +233,28 @@ func decodeAPIError(resp *http.Response) error {
 	return apiErr
 }
 
-// snippet collapses raw's whitespace into single spaces and truncates it to
-// maxErrorBodySnippet runes, so an HTML proxy page or plain-text error shows
-// up as a recognizable fragment in an error message instead of vanishing.
+// snippet collapses raw's whitespace into single spaces, strips non-printable
+// characters, and truncates the result to maxErrorBodySnippet runes, so an
+// HTML proxy page or plain-text error shows up as a recognizable fragment in
+// an error message instead of vanishing.
+//
+// The stripping is a security measure, not cosmetic: raw is untrusted,
+// server-controlled bytes — from a proxy, a captive portal, or a spoofed or
+// compromised host — and this snippet is printed straight to the user's
+// terminal (a CLI today, a TUI from milestone 3 on). Without stripping, a
+// hostile server could embed ANSI/terminal control sequences in its response
+// body — clearing the screen, forging fake output, or renaming the terminal
+// tab via an OSC sequence — turning a diagnostic aid into a terminal
+// injection vector. unicode.IsPrint reports true for the ASCII space, so the
+// single-space collapsing above survives; strings.Fields has already turned
+// newlines and tabs into that same space.
 func snippet(raw []byte) string {
-	s := strings.Join(strings.Fields(string(raw)), " ")
+	s := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, strings.Join(strings.Fields(string(raw)), " "))
 	if s == "" {
 		return ""
 	}
