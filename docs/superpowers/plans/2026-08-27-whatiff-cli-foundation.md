@@ -5299,175 +5299,143 @@ being wrong.
 
 ### Task 11: Makefile targets, package docs, and an end-to-end check
 
+**Status: DONE**, with one genuine bug found by Step 5 and left unfixed —
+see that step below. Actual commit: `chore(cli): build targets and package
+documentation` (`make pre-commit` needed no follow-up fix; it passed clean on
+the first run).
+
 **Files:**
-- Modify: `Makefile`
-- Create: `internal/cli/config/_PACKAGE_SUMMARY.md`
-- Create: `internal/cli/client/_PACKAGE_SUMMARY.md`
+- Modified: `Makefile`, `docs/ARCHITECTURE_SUMMARY.md`
+- Created: `internal/cli/config/_PACKAGE_SUMMARY.md`,
+  `internal/cli/client/_PACKAGE_SUMMARY.md`,
+  `cmd/whatiff-cli/_PACKAGE_SUMMARY.md` (a third summary beyond this plan's
+  original scope — the architecture summary's own rule requires one for every
+  small `main` package too, and `cmd/whatiff-cli` qualifies).
 
-- [ ] **Step 1: Add the Makefile targets**
+- [x] **Step 1: Add the Makefile targets**
 
-Append to `Makefile`. Keep the existing `.PHONY` style used by neighbouring
-targets, and add `build-cli install-cli` to the `.PHONY` list.
+Added, immediately after `build-cli-crosscheck`. Matches the plan's shape
+with one addition: each target prints a `✅ ...` confirmation line, matching
+every other target in this Makefile (`build-cli-crosscheck` included) — the
+plan's snippet omitted that only for brevity.
 
 ```makefile
-build-cli: ## Build the wi CLI into ./bin/wi
+build-cli: ## Build the wi CLI for this machine into ./bin/wi
 	@mkdir -p bin
-	go build -o bin/wi ./cmd/whatiff-cli
+	@go build -o bin/wi ./cmd/whatiff-cli
+	@echo "✅ built ./bin/wi"
 
-install-cli: ## Install the wi CLI into $(GOPATH)/bin
-	go install ./cmd/whatiff-cli
+install-cli: ## Install the wi CLI via 'go install' ($(GOPATH)/bin or $(GOBIN))
+	@go install ./cmd/whatiff-cli
+	@echo "✅ installed as 'whatiff-cli' (go install names the binary after its directory, cmd/whatiff-cli — symlink it to 'wi' on your PATH, e.g.: ln -s \$$(go env GOPATH)/bin/whatiff-cli \$$(go env GOPATH)/bin/wi)"
 ```
 
-`go install` names the binary after the directory, so this installs
-`whatiff-cli`. Users who want `wi` on their PATH symlink it, which the README
-note in Step 3 explains.
+The `go install`-names-the-binary-after-the-directory note lives inline in
+`install-cli`'s own help/echo text rather than a separate README note, so a
+user hits it exactly when it's relevant instead of having to have read the
+README first. `docs/ARCHITECTURE_SUMMARY.md`'s new CLI subsection (Step 3
+below) repeats the same one-liner for anyone reading architecture docs
+top-down instead.
 
-- [ ] **Step 2: Verify the targets work**
+- [x] **Step 2: Verify the targets work**
 
-Run: `make build-cli && ./bin/wi 2>&1 | head -5`
-Expected: the usage text, listing `login` and `chats`. Exit code 2.
+`make build-cli && ./bin/wi` (no args) printed the usage text listing `login`
+and `chats`, exit code 2, as expected. `make install-cli` also verified
+separately (installs as `whatiff-cli` under `$(go env GOPATH)/bin`).
 
-- [ ] **Step 3: Write the package summaries**
+- [x] **Step 3: Write the package summaries**
 
-Both follow the seven-heading template in `docs/ARCHITECTURE_SUMMARY.md`: Role,
-Responsibilities, Key types and entry points, Dependencies, Non-obvious
-decisions, Testing, Related.
+The three drafts originally inlined in this plan step were written **before**
+`paths.go`, `auth.go`, `chat.go`, the corrupt-credentials-file recovery, the
+single-flight refresh, `ChatPage`, and the terminal-sanitization work existed
+— they undersold what actually shipped and were **not** used verbatim. The
+real, current summaries live at:
 
-`internal/cli/config/_PACKAGE_SUMMARY.md`:
+- `internal/cli/config/_PACKAGE_SUMMARY.md`
+- `internal/cli/client/_PACKAGE_SUMMARY.md`
+- `cmd/whatiff-cli/_PACKAGE_SUMMARY.md`
 
-```markdown
-# Package: `internal/cli/config`
+All three follow the repo's seven-heading template (Role, Responsibilities,
+Key types and entry points, Dependencies, Non-obvious decisions, Testing,
+Related) and document the hard-won decisions from milestone 1's review cycle
+— atomic-save internals, the single-flight refresh's panic-safe cleanup, the
+`tty_linux.go` implicit-build-constraint trap, and more. Read those files
+directly rather than this plan for current content; this plan step is a
+historical record of intent, not a mirror of the shipped docs.
 
-## Role
+`docs/ARCHITECTURE_SUMMARY.md` also picked up a short new "CLI (`wi`)"
+subsection under **High-Level System Architecture**, alongside Frontend/
+Backend, per that doc's own anti-drift rule (a new `internal/cli/` subtree
+and a new binary is a system-boundary change). It notes the CLI as a second,
+pure-consumer client that adds no server surface and doesn't touch
+`openapi.yaml`.
 
-Configuration and credential storage for the `wi` CLI.
+- [x] **Step 4: Run the full repo gate**
 
-## Responsibilities
+`make pre-commit` (`fmt vet tidy test build build-cli-crosscheck
+check-no-local-models check-compose-defaults check-public-hygiene`) passed
+clean on the first run — no fix commit was needed for this task.
 
-- Parse `config.toml` (profiles, default profile, download directory).
-- Resolve a profile by name, falling back to a builtin `local` profile so the
-  CLI works with no config file against `make run`.
-- Store and load per-profile token pairs in a `0600` JSON file.
+- [x] **Step 5: End-to-end check against a real server**
 
-## Key types and entry points
+Ran for real: `cp .env.example .env` with generated secrets, `AUTO_MIGRATE=true`
+for the first boot, `make check-env` → `make db-up` → `make run-mock`
+(backgrounded), registered a user via `POST /api/user/register`, then drove
+`./bin/wi login` through a pty (a scripted terminal, not piped stdin — the
+password prompt requires a real TTY) with `XDG_CONFIG_HOME` pointed at a
+scratch directory so the real user's `~/.config` was never touched.
 
-- `Config`, `Profile`, `Load`, `Config.Resolve`, `DefaultPath`, `Dir`.
-- `Credentials`, `CredentialStore`, `DefaultCredentialStore`, `ErrNoCredentials`.
+Results:
+- `wi login` printed `Logged in as <username>`, exit 0.
+- `stat -c '%a' $XDG_CONFIG_HOME/whatiff/credentials.json` → `600`, exactly
+  as required.
+- `wi chats` on the fresh account printed `No chats found.`
+- Created a chat via `POST /api/chat`; `wi chats` then rendered a one-row
+  table (`NAME MODEL LAST MESSAGE UNREAD`).
+- `wi --json chats` (note: `--json` is a top-level flag per `wi`'s own usage
+  text — `wi [flags] <command>` — so it must precede the subcommand; `wi
+  chats --json` correctly errors with `flag provided but not defined:
+  -json`, which is expected/documented behavior, not a bug) printed valid
+  JSON with both `results` and `total_count`.
+- A second chat plus `--limit 1` correctly printed a one-row table and the
+  `Showing 1 of 2 chats. Use --limit to see more.` notice on stderr.
+- `--archived` on an account with no archived chats correctly printed `No
+  chats found.`
+- A wrong-password login attempt failed cleanly (`login failed: POST
+  /user/login: Invalid credentials (HTTP 401)`, exit 1) and — importantly —
+  left the previously-stored valid credentials untouched (`wi chats` still
+  worked immediately afterward with no re-login).
+- Calling `wi chats` before ever logging in, and with an unknown `--profile`,
+  both produced clear, actionable error messages naming the fix.
 
-## Dependencies
+**Genuine bug found — not fixed here (out of scope for this CLI-only task,
+and outside `internal/cli/*`/`cmd/whatiff-cli` entirely):**
+`wi chats --search <term>` fails every time against a chat with no tags, via
+`GET /chat?search=...` → HTTP 500 `Failed to list chats`. Server log:
+`pq: cannot extract elements from a scalar`. Root cause, traced via `psql`
+against the live `chats` table: Ent's `field.Strings("tags").Optional()`
+(`ent/schema/chat.go`) stores an empty/never-set tags value as the **JSON
+literal `null`** in the `jsonb` column — confirmed with `jsonb_typeof(tags)`
+returning `'null'`, while `tags IS NULL` (SQL NULL) is `false`. The search
+path in `internal/datastore/chat.go`'s `ListChats` builds
+`jsonb_array_elements_text(COALESCE(tags::jsonb, '[]'::jsonb))` to search
+tags; `COALESCE` only substitutes on **SQL** NULL, so a JSON-null tags value
+passes through unchanged into `jsonb_array_elements_text`, which errors on
+any non-array scalar (including JSON null). Since most chats never have tags
+set, this means **`GET /chat?search=...` — an ordinary, everyday call — fails
+100% of the time** for a typical account. `--archived`, `--limit`, and no
+filter at all all avoid this code path and work correctly; only `--search`
+(and any other future caller of `filters.Query`) hits it. This was invisible
+to every prior test in this milestone because none of them ran against real
+Postgres jsonb semantics — an `httptest` double has no `jsonb_array_elements_text`
+to get wrong. Flagging for a separate fix in `internal/datastore/chat.go`
+(the fix is almost certainly `COALESCE(NULLIF(tags::jsonb, 'null'::jsonb),
+'[]'::jsonb)` or equivalent, not a CLI change).
 
-- **Inbound:** `cmd/whatiff-cli`.
-- **Outbound:** `github.com/BurntSushi/toml`, stdlib only otherwise.
-
-## Non-obvious decisions
-
-- Credentials live in a separate file from `config.toml` so the config file
-  stays safe to share or keep in a dotfiles repo.
-- A file store rather than the OS keyring: headless servers and containers are a
-  primary CLI use case, and keyring backends are absent or fail there.
-- `CredentialStore.Save` writes to a temp file and renames, so an interrupted
-  save cannot truncate the file and lock the user out of every profile at once.
-- A missing config file is not an error.
-
-## Testing
-
-- `config_test.go` — profile resolution, TOML loading, malformed input.
-- `credentials_test.go` — round trip, profile independence, `0600` mode,
-  `ErrNoCredentials`.
-
-## Related documentation
-
-- [CLI design spec](../../../docs/superpowers/specs/2026-08-27-whatiff-cli-design.md)
-```
-
-`internal/cli/client/_PACKAGE_SUMMARY.md`:
-
-```markdown
-# Package: `internal/cli/client`
-
-## Role
-
-The only place the `wi` CLI speaks HTTP to a WhatIff server.
-
-## Responsibilities
-
-- Issue authenticated JSON requests and decode them into `internal/models` types.
-- Convert non-2xx responses into `*APIError` carrying the server's own message.
-- Refresh an expired access token transparently and retry the request once.
-- Resource calls: `Login`, `ListChats`.
-
-## Key types and entry points
-
-- `Client`, `New`, `Tokens`, `APIError`.
-- `Client.do` — the method every resource call uses; handles re-auth.
-- `Client.doJSON` — a single request with no refresh handling.
-- `Client.Login`, `Client.ListChats`, `ListChatsOptions`.
-
-## Dependencies
-
-- **Inbound:** `cmd/whatiff-cli`.
-- **Outbound:** `internal/models`, stdlib `net/http`.
-
-## Non-obvious decisions
-
-- Decoding into `internal/models` is why the CLI lives in this repo: the client
-  and server cannot disagree about a payload shape.
-- `refreshTokens` takes the *stale* access token and single-flights, so a burst
-  of concurrent 401s produces exactly one call to `/user/refresh`.
-- `do` retries exactly once after a refresh; a persistent 401 surfaces rather
-  than looping.
-- `ListChats` decodes into a chat-specific page struct rather than
-  `models.PaginatedResponse`, whose `[]any` results would force a second decode.
-- `decodeAPIError` limits the body it reads and tolerates non-JSON bodies, so a
-  proxy's HTML 502 still yields a useful error.
-
-## Testing
-
-- `client_test.go` — success decode, error envelope, non-JSON error body,
-  401-refresh-retry, no-double-retry.
-- `auth_test.go` — login token storage, refresh persistence, single-flight
-  (run with `-race`).
-- `chat_test.go` — pagination envelope unwrapping, query parameters.
-
-## Related documentation
-
-- [CLI design spec](../../../docs/superpowers/specs/2026-08-27-whatiff-cli-design.md)
-```
-
-- [ ] **Step 4: Run the full repo gate**
-
-Run: `make pre-commit`
-Expected: PASS. This runs `fmt vet tidy test build check-no-local-models`. If
-`fmt` complains, run `make fmt-fix` and re-run.
-
-- [ ] **Step 5: End-to-end check against a real server**
-
-This is a manual verification, not an automated test — the automated
-`make cli-e2e` target arrives in milestone 2 when there is a conversation to
-assert on.
+- [x] **Step 6: Commit**
 
 ```bash
-make db-up
-make run-mock &          # or: make dev-up
-./bin/wi login           # register first via the web app or the API if needed
-./bin/wi chats
-./bin/wi chats --json
-```
-
-Expected: `login` stores credentials and prints `Logged in as <username>`;
-`chats` prints a table (or `No chats found.` on a fresh account); `--json`
-prints a JSON array. Then confirm the credential file is locked down:
-
-```bash
-stat -c '%a' ~/.config/whatiff/credentials.json
-```
-
-Expected: `600`.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add Makefile internal/cli/config/_PACKAGE_SUMMARY.md internal/cli/client/_PACKAGE_SUMMARY.md
+git add Makefile docs/ARCHITECTURE_SUMMARY.md cmd/whatiff-cli/_PACKAGE_SUMMARY.md internal/cli/client/_PACKAGE_SUMMARY.md internal/cli/config/_PACKAGE_SUMMARY.md
 git commit -m "chore(cli): build targets and package documentation"
 ```
 
@@ -5475,10 +5443,13 @@ git commit -m "chore(cli): build targets and package documentation"
 
 ## Milestone 1 done when
 
-- `make pre-commit` passes.
+- `make pre-commit` passes. **Done.**
 - `wi login` against a `make run-mock` stack stores a `0600` credential file.
-- `wi chats` and `wi chats --json` both list chats.
-- Both new packages have a `_PACKAGE_SUMMARY.md`.
+  **Done — verified live, see Step 5.**
+- `wi chats` and `wi chats --json` (as `wi --json chats`, see Step 5's note
+  on flag placement) both list chats. **Done — verified live.**
+- Both new packages have a `_PACKAGE_SUMMARY.md`. **Done — plus a third for
+  `cmd/whatiff-cli`.**
 
 ## What this milestone deliberately does not do
 
