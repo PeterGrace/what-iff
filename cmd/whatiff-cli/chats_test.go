@@ -121,3 +121,34 @@ func TestSanitizeCell(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitizeCellTruncatesLongValues is the regression test for a chat name
+// wrecking the tabwriter's column alignment: names are bounded at 200
+// characters (MaxLen(200) in the chat ent schema), but 200 untruncated
+// characters in a NAME column still shifts every column after it for that
+// row. sanitizeCell must cut a long value down to something scannable, not
+// just strip and collapse it.
+func TestSanitizeCellTruncatesLongValues(t *testing.T) {
+	long := strings.Repeat("x", 200)
+	got := sanitizeCell(long)
+	gotRunes := []rune(got)
+	// maxCellWidth characters of "x" plus the single trailing "…" rune.
+	if len(gotRunes) != maxCellWidth+1 {
+		t.Fatalf("len(sanitizeCell(200 x's)) = %d, want %d", len(gotRunes), maxCellWidth+1)
+	}
+	if gotRunes[len(gotRunes)-1] != '…' {
+		t.Errorf("sanitizeCell(200 x's) = %q, want it to end with an ellipsis", got)
+	}
+	if !strings.HasPrefix(got, strings.Repeat("x", maxCellWidth)) {
+		t.Errorf("sanitizeCell(200 x's) = %q, want it to start with %d x's", got, maxCellWidth)
+	}
+}
+
+// TestSanitizeCellDoesNotTruncateShortValues pins that ordinary, short chat
+// names are unaffected by the truncation added for the long-name case above.
+func TestSanitizeCellDoesNotTruncateShortValues(t *testing.T) {
+	short := "deploy plan"
+	if got := sanitizeCell(short); got != short {
+		t.Errorf("sanitizeCell(%q) = %q, want it unchanged", short, got)
+	}
+}

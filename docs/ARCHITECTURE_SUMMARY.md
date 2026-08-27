@@ -73,7 +73,7 @@
   Run `npm install` first if `openapi-typescript` is missing; it arrived with the e2e restructure, so a `node_modules` from before then will not have it.
 - Served by nginx (`web/app/nginx.conf`) with a deliberate split cache policy: `index.html` is `no-cache` and the content-hashed `*.js`/`*.css` are `immutable`. The entry point names the hashed bundles, so letting it be cached keeps browsers on a previous deploy's JavaScript — deploys and local rebuilds then appear to have no effect.
 
- ### CLI (`wi`)
+### CLI (`wi`)
 - A second client alongside the Angular SPA: `internal/cli/{config,client}` plus the `cmd/whatiff-cli` binary (installed name `whatiff-cli`; symlink it to `wi` on PATH). It is a pure consumer of the same REST API the SPA uses — it adds no server surface, defines no new endpoints, and does not touch `openapi.yaml`.
 - Milestone 1 provides `wi login` (interactive credential exchange, stored in a `0600` per-profile credential file) and `wi chats` (list chats, table or `--json`). Conversation handling arrives in a later milestone.
 - See `internal/cli/config/_PACKAGE_SUMMARY.md`, `internal/cli/client/_PACKAGE_SUMMARY.md`, and `cmd/whatiff-cli/_PACKAGE_SUMMARY.md` for package-level detail.

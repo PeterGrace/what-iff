@@ -6,11 +6,33 @@
 
 **Architecture:** Three new packages under `internal/cli/`. `config` owns TOML profiles and a `0600` credential file. `client` is the single chokepoint that speaks HTTP, decoding into `internal/models` types so client and server DTOs cannot drift. `cmd/whatiff-cli` is thin dispatch over those. No backend changes.
 
-**Tech Stack:** Go 1.27, `github.com/BurntSushi/toml` (already a direct dep, `go.mod:7`), `golang.org/x/term` (already a direct dep, `go.mod:41`), stdlib `net/http` and `net/http/httptest`.
+**Tech Stack:** Go 1.27, `github.com/BurntSushi/toml` (already a direct dep, `go.mod:7`), `golang.org/x/term` (already a direct dep, `go.mod:42`), `golang.org/x/sys` (promoted to a direct dep by Task 9's terminal-flush ioctl, `go.mod:41`), stdlib `net/http` and `net/http/httptest`.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-whatiff-cli-design.md`
 
 ---
+
+## Status: executed
+
+This plan has been carried out. Tasks 1–10 are complete and shipped; Task 11
+(the live end-to-end check) is marked `- [x]` below because it was run for
+real, verifying the other ten. The remaining `- [ ]` checkboxes on Tasks
+1–10 are vestigial — an artifact of the plan being written and executed in
+one pass rather than checked off step-by-step — not a sign the work is
+outstanding. Do not go back and re-check them individually.
+
+A whole-milestone review after Task 11 landed found a few gaps no
+per-task review could see on its own (a macOS-destructive test default, a
+subcommand that skipped the shared flag-parsing convention, global flags
+that only worked before the subcommand name, and others) and fixed them in
+follow-up commits on top of what this plan describes. The task bodies below
+were left as originally written/executed rather than rewritten around those
+fixes; where a fix changes something a task body asserts, this status
+section or an inline note says so instead.
+
+Known gap: `wi chats --search` is shipped and works correctly on the CLI
+side but fails 100% of the time against the real server — see "Milestone 1
+done when" below and issue #8.
 
 ## Milestone context
 
@@ -42,13 +64,17 @@ what the engine's event stream turns out to feel like in practice.
 | `internal/cli/config/credentials.go` | Per-profile token storage, `0600`, atomic writes |
 | `internal/cli/config/_PACKAGE_SUMMARY.md` | Package docs (repo anti-drift rule) |
 | `internal/cli/client/client.go` | Base HTTP client, typed errors, 401 refresh |
-| `internal/cli/client/auth.go` | `Login`, `Refresh` |
+| `internal/cli/client/auth.go` | `Login`; unexported `refreshTokens`, the single-flight 401 retry `do` calls |
 | `internal/cli/client/chat.go` | `ListChats` and the pagination envelope |
 | `internal/cli/client/_PACKAGE_SUMMARY.md` | Package docs |
 | `cmd/whatiff-cli/main.go` | Flag parsing, subcommand dispatch |
 | `cmd/whatiff-cli/login.go` | `wi login` — interactive password entry |
 | `cmd/whatiff-cli/chats.go` | `wi chats`, `--json` |
-| `Makefile` | `build-cli`, `install-cli` targets |
+| `cmd/whatiff-cli/tty_tcflsh.go` | `flushPendingInput` via `TCFLSH` (linux, aix, solaris) |
+| `cmd/whatiff-cli/tty_bsd.go` | `flushPendingInput` via `TIOCFLUSH` (the BSD family) |
+| `cmd/whatiff-cli/tty_other.go` | `flushPendingInput` no-op (every remaining GOOS) |
+| `cmd/whatiff-cli/_PACKAGE_SUMMARY.md` | Package docs |
+| `Makefile` | `build-cli`, `install-cli`, `build-cli-crosscheck` targets |
 
 Files are split by responsibility rather than layer, and each stays small enough
 to hold in context while editing.
@@ -4853,6 +4879,24 @@ on an amd64 host; `aix` needs `GOARCH=ppc64` (its only supported arch) and
 `solaris`/`illumos` need `GOARCH=amd64` explicitly, or `go build` reports an
 unsupported pair. Expected: every one builds with no output.
 
+- [ ] **Step 6: Commit**
+
+```bash
+git add cmd/whatiff-cli/login.go cmd/whatiff-cli/tty_tcflsh.go \
+  cmd/whatiff-cli/tty_bsd.go cmd/whatiff-cli/tty_other.go \
+  cmd/whatiff-cli/login_test.go cmd/whatiff-cli/main_test.go \
+  go.mod Makefile
+git commit -m "feat(cli): wi login command"
+```
+
+`go.mod` is included deliberately and only for the `golang.org/x/sys`
+indirect-to-direct promotion from Step 4 above — `go.sum`, `go work`, and
+`ent/` are never part of this commit. `Makefile` is included for
+`build-cli-crosscheck` (Step 5), the check that exists specifically because
+nothing else in the pipeline would have caught the platform split being
+wrong. `chats.go` and `chats_test.go` are NOT part of this commit — they
+don't exist yet; Task 10 below creates and commits them separately.
+
 ### Task 10: `wi chats`
 
 **Files:**
@@ -5286,16 +5330,14 @@ appear — a normal login must stay silent.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/whatiff-cli/ .gitignore go.mod Makefile
-git commit -m "fix(cli): use the right terminal flush ioctl per platform"
+git add cmd/whatiff-cli/chats.go cmd/whatiff-cli/chats_test.go
+git commit -m "feat(cli): wi chats command"
 ```
 
-`go.mod` is included deliberately and only for the `golang.org/x/sys`
-indirect-to-direct promotion described in Task 9 — `go.sum`, `go work`, and
-`ent/` are never part of this commit. `Makefile` is included for
-`build-cli-crosscheck` (Task 9 step 5), the check that exists specifically
-because nothing else in the pipeline would have caught the platform split
-being wrong.
+Only `chats.go` and its test are new here — `login.go`, the three `tty_*.go`
+files, `go.mod`, and `Makefile` were already committed at the end of Task 9
+(its own Step 6). `.gitignore` is not part of this commit either: nothing in
+Task 9 or Task 10 edits it.
 
 ### Task 11: Makefile targets, package docs, and an end-to-end check
 
@@ -5392,11 +5434,16 @@ Results:
 - `wi chats` on the fresh account printed `No chats found.`
 - Created a chat via `POST /api/chat`; `wi chats` then rendered a one-row
   table (`NAME MODEL LAST MESSAGE UNREAD`).
-- `wi --json chats` (note: `--json` is a top-level flag per `wi`'s own usage
-  text — `wi [flags] <command>` — so it must precede the subcommand; `wi
-  chats --json` correctly errors with `flag provided but not defined:
-  -json`, which is expected/documented behavior, not a bug) printed valid
-  JSON with both `results` and `total_count`.
+- `wi --json chats` (note, historical: at the time of this run, `--json` was
+  a top-level-only flag per `wi`'s own usage text — `wi [flags] <command>` —
+  so it had to precede the subcommand; `wi chats --json` errored with `flag
+  provided but not defined: -json`. This was flagged in that review as
+  "expected/documented behavior, not a bug," but the design spec documents
+  `wi chats --json | jq ...` as the intended usage, so a later whole-milestone
+  review treated the mismatch as a real gap and fixed it — `--profile`/
+  `--json` are now registered on each subcommand's own FlagSet too, so both
+  orderings work. See "Status: executed" at the top of this document.)
+  printed valid JSON with both `results` and `total_count`.
 - A second chat plus `--limit 1` correctly printed a one-row table and the
   `Showing 1 of 2 chats. Use --limit to see more.` notice on stderr.
 - `--archived` on an account with no archived chats correctly printed `No
@@ -5446,15 +5493,25 @@ git commit -m "chore(cli): build targets and package documentation"
 - `make pre-commit` passes. **Done.**
 - `wi login` against a `make run-mock` stack stores a `0600` credential file.
   **Done — verified live, see Step 5.**
-- `wi chats` and `wi chats --json` (as `wi --json chats`, see Step 5's note
-  on flag placement) both list chats. **Done — verified live.**
+- `wi chats` and `wi chats --json` both list chats, in either flag order
+  (`--profile`/`--json` were later registered on each subcommand's own
+  FlagSet, not just main's top-level one — see Step 5's original note on
+  flag placement for the limitation this fixed). **Done — verified live.**
 - Both new packages have a `_PACKAGE_SUMMARY.md`. **Done — plus a third for
   `cmd/whatiff-cli`.**
+- `wi chats --search` is shipped but fails 100% of the time against the
+  real server today — a server-side bug, not a CLI defect, filed separately
+  as issue #8. The flag itself, its client-side query-param plumbing, and
+  its CLI-level test coverage are all correct; the fix belongs in
+  `internal/handlers/chat`, out of scope for this plan.
 
 ## What this milestone deliberately does not do
 
 - No conversation handling — that is the `engine` package in milestone 2.
-- No TUI, no Bubble Tea dependency yet. Milestone 1 adds **zero** new modules to
-  `go.mod`; both dependencies it uses are already direct requirements. Keeping
+- No TUI, no Bubble Tea dependency yet. Milestone 1 uses three dependencies —
+  `github.com/BurntSushi/toml`, `golang.org/x/term`, and `golang.org/x/sys`
+  (the last promoted from indirect to direct by Task 9's terminal-flush
+  ioctl) — all already present in `go.sum` before this milestone started, so
+  the only `go.mod` change is that promotion, not a wholly new module. Keeping
   the dependency change out of the foundation makes the eventual Bubble Tea
   commit a small, reviewable diff on its own.

@@ -145,28 +145,45 @@ func normalizeResultsForJSON(page client.ChatPage) client.ChatPage {
 	return page
 }
 
-// sanitizeCell strips non-printable characters from s and collapses any
+// maxCellWidth caps how many runes of a sanitizeCell value are printed. A
+// server-supplied chat/model name is bounded (MaxLen(200) in the chat ent
+// schema) but not narrow, and an untruncated 200-rune name in a NAME column
+// still wrecks the tabwriter's alignment for every row after it - the same
+// class of problem maxErrorBodySnippet solves for an error body, at a much
+// smaller width because a table cell has to stay scannable, not just bounded.
+const maxCellWidth = 60
+
+// sanitizeCell strips non-printable characters from s, collapses any
 // whitespace runs (including a tab or newline embedded in a chat name) to a
-// single space, so server-controlled text is safe to print unescaped into a
-// tabwriter cell.
+// single space, and truncates the result to maxCellWidth runes, so
+// server-controlled text is safe to print unescaped into a tabwriter cell
+// without one long value blowing out every column after it.
 //
-// This mirrors internal/cli/client's snippet() (client.go), which solves the
-// identical problem for a raw HTTP error body reaching a terminal: without
-// stripping, a chat name containing an ANSI/OSC escape sequence could forge
-// terminal output or rename the tab, and an embedded tab or newline would
-// shift every column after it in the table. It is reimplemented here rather
-// than imported because the client package is a thin HTTP transport with no
-// terminal-rendering concern of its own - that split is deliberate, not an
-// oversight, so this comment is what keeps the two implementations in step
-// if one of them changes.
+// This mirrors the stripping half of internal/cli/client's snippet()
+// (client.go), which solves the identical safety problem for a raw HTTP
+// error body reaching a terminal: without stripping, a chat name containing
+// an ANSI/OSC escape sequence could forge terminal output or rename the tab,
+// and an embedded tab or newline would shift every column after it in the
+// table. It does NOT mirror snippet()'s truncation width - 200 runes there is
+// sized to keep enough of an error body to recognize a captive portal page;
+// a table cell needs to stay far narrower than that to remain scannable at
+// all. It is reimplemented here rather than imported because the client
+// package is a thin HTTP transport with no terminal-rendering concern of its
+// own - that split is deliberate, not an oversight, so this comment is what
+// keeps the two implementations in step if one of them changes.
 func sanitizeCell(s string) string {
 	collapsed := strings.Join(strings.Fields(s), " ")
-	return strings.Map(func(r rune) rune {
+	stripped := strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) {
 			return r
 		}
 		return -1
 	}, collapsed)
+	r := []rune(stripped)
+	if len(r) > maxCellWidth {
+		return string(r[:maxCellWidth]) + "…"
+	}
+	return stripped
 }
 
 // humanizeSince renders a coarse relative time. Chat listings are scanned, not

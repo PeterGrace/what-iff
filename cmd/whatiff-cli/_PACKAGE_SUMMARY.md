@@ -87,14 +87,20 @@ milestone 2.
   parsing the table) never has to special-case a trailing sentence mixed into
   its data. `--json` mode never reaches the truncation notice at all —
   `TotalCount` is already in that payload for a script to check itself.
-- **`sanitizeCell` mirrors `internal/cli/client`'s `snippet()`** rather than
-  importing it: both strip non-printable characters and collapse whitespace
-  from server-controlled text (a chat name/model name here, an HTTP error
-  body there) before it reaches a terminal, defending against the same
-  ANSI/OSC terminal-injection risk. They're reimplemented separately because
-  `internal/cli/client` is a thin HTTP transport with no terminal-rendering
-  concern of its own — see `chats.go:sanitizeCell`'s doc comment for what
-  keeps the two in step if one changes.
+- **`sanitizeCell` mirrors the *stripping* half of `internal/cli/client`'s
+  `snippet()`**, not the whole function, rather than importing it: both strip
+  non-printable characters and collapse whitespace from server-controlled
+  text (a chat name/model name here, an HTTP error body there) before it
+  reaches a terminal, defending against the same ANSI/OSC terminal-injection
+  risk. They're reimplemented separately because `internal/cli/client` is a
+  thin HTTP transport with no terminal-rendering concern of its own. The two
+  deliberately do NOT share a truncation width: `snippet()` caps at 200 runes
+  (enough to recognize a captive-portal page), `sanitizeCell` at 60
+  (`maxCellWidth`) — a table cell has to stay scannable, not just bounded, and
+  chat/model names are already bounded server-side (`MaxLen(200)` in the chat
+  ent schema) but that bound is still far too wide for a tabwriter column. See
+  `chats.go:sanitizeCell`'s doc comment for what keeps the two in step if one
+  changes.
 
 ## Testing
 
