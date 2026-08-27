@@ -11,7 +11,8 @@ Configuration and credential storage for the `wi` CLI.
 - Resolve a profile by name, falling back to a builtin `local` profile so the
   CLI works with no config file at all against `make run`/`make run-mock`.
 - Locate the CLI's config directory and files (`paths.go`), following the OS
-  user config directory (`XDG_CONFIG_HOME` on Linux).
+  user config directory (`XDG_CONFIG_HOME` on Linux), or `WHATIFF_CONFIG_DIR`
+  when set — see "Non-obvious decisions" below.
 - Store and load per-profile token pairs in a single `0600` JSON file,
   separate from `config.toml`.
 
@@ -31,6 +32,22 @@ Configuration and credential storage for the `wi` CLI.
 
 ## Non-obvious decisions
 
+- **`WHATIFF_CONFIG_DIR` overrides `Dir()` entirely, not just a piece of it.**
+  `os.UserConfigDir` is not XDG-compliant on every platform: darwin and
+  windows ignore `XDG_CONFIG_HOME` unconditionally and always resolve to
+  `$HOME/Library/Application Support` or `%AppData%` respectively (verified
+  against `os/file.go`). Pinning `XDG_CONFIG_HOME` to redirect a test or a
+  scratch run therefore silently does nothing on those platforms — a hermetic
+  test would read and overwrite the developer's real `config.toml` and
+  `credentials.json`. `WHATIFF_CONFIG_DIR` is honoured identically on every
+  platform and is what every test in this package and `cmd/whatiff-cli` sets;
+  it also backs the `make cli-e2e` target planned for a later milestone. When
+  set it *is* the config directory verbatim (no further `whatiff` join) —
+  the caller who set it chose the directory on purpose.
+- **`Profile.Model`, `Profile.Personality`, and `Config.DownloadDir` are
+  parsed and validated today but not read by anything else** — reserved for
+  later milestones (the turn engine and download handling), not dead code to
+  remove.
 - **Credentials are a separate file from `config.toml`** so the config file
   stays safe to commit to a dotfiles repo or share — it never carries a
   secret.

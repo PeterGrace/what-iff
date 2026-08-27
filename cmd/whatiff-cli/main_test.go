@@ -10,12 +10,21 @@ import (
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
 )
 
-// writeConfig points $XDG_CONFIG_HOME at a fresh temp dir for this test and
-// writes contents (if non-empty) to the whatiff/config.toml the config
-// package expects there.
+// writeConfig points $WHATIFF_CONFIG_DIR at a fresh temp dir for this test
+// and writes contents (if non-empty) to the config.toml the config package
+// expects there.
+//
+// WHATIFF_CONFIG_DIR, not XDG_CONFIG_HOME: config.Dir (internal/cli/config,
+// paths.go) calls os.UserConfigDir, which on darwin and windows ignores
+// XDG_CONFIG_HOME completely and always resolves to the real per-OS user
+// config location. Setting XDG_CONFIG_HOME here would do nothing on those
+// platforms, and this whole test suite would read and overwrite the
+// developer's actual ~/Library/Application Support/whatiff/config.toml and
+// credentials.json every time `go test`/`make test` ran. WHATIFF_CONFIG_DIR
+// is honoured identically on every platform.
 func writeConfig(t *testing.T, contents string) {
 	t.Helper()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("WHATIFF_CONFIG_DIR", t.TempDir())
 	if contents == "" {
 		return
 	}
