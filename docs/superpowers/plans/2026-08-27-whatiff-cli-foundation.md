@@ -3734,12 +3734,40 @@ git commit -m "feat(cli): list chats"
 
 **Files:**
 - Create: `cmd/whatiff-cli/main.go`
+- Test: `cmd/whatiff-cli/main_test.go`
+
+#### Why `-h`/`--help` gets its own branch instead of `flag.Usage`
+
+The package-level `flag` API exits 2 on `-h`/`--help` unconditionally — right
+for a genuine usage error, wrong for someone deliberately asking for help.
+`main` uses its own `flag.NewFlagSet("wi", flag.ContinueOnError)` with output
+discarded, so nothing is printed until `main` decides which of the two cases
+it is: `errors.Is(err, flag.ErrHelp)` (covers `-h`, `-help`, and `--help` —
+`flag` treats one and two leading dashes the same) prints usage to stdout and
+exits 0; any other parse error prints to stderr and exits 2. A bare `wi help`
+gets the same stdout/exit-0 treatment as a first positional argument, since
+"help" reads as a request for help whether or not it's spelled as a flag.
+
+#### Why `main` wires `signal.NotifyContext` instead of `context.Background()`
+
+`internal/cli/client`'s `do`/`refreshTokens` already special-cases
+`context.Canceled` so a canceled context unwinds a request cleanly instead of
+surfacing as a confusing 401-adjacent error (see that package's doc
+comments) — but nothing ever canceled the context that reached it, which made
+that handling unreachable and left Ctrl-C to just kill the process mid-request.
+`signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)`
+gives Ctrl-C (and a container's SIGTERM) something to cancel; `stop` is
+deferred so the signal handler is released once `main` returns normally.
+`main` then checks `errors.Is(err, context.Canceled)` on the way out and
+prints a short "cancelled" instead of the generic wrapped-error message —
+the user asked for this, so it should not read as a crash.
+
+There is no unit test for `main` itself or for the signal wiring: both need a
+real process/terminal to exercise meaningfully. `loadProfile` is unit tested
+below since it is pure; `main`, `run`'s dispatch, and the exit codes are
+covered by manual verification in Task 11's end-to-end check.
 
 - [ ] **Step 1: Write the implementation**
-
-There is no unit test for this file: it is argument parsing and process exit,
-and the behavior worth testing lives in `config` and `client`, which are already
-covered. Task 11's end-to-end check exercises it.
 
 ```go
 // Command whatiff-cli (installed as `wi`) is a terminal client for WhatIff.
@@ -3750,34 +3778,76 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
 )
 
 func main() {
-	profile := flag.String("profile", os.Getenv("WHATIFF_PROFILE"), "config profile to use")
-	asJSON := flag.Bool("json", false, "emit JSON instead of human-readable output")
-	flag.Usage = usage
-	flag.Parse()
+	// Ctrl-C (and a container's SIGTERM) cancel ctx rather than killing the
+	// process outright. The client package already propagates a canceled
+	// context correctly through the token-refresh path (see
+	// internal/cli/client/client.go's do/refreshTokens) - without this wiring
+	// that plumbing had nothing to cancel it, so Ctrl-C just killed the
+	// process mid-request instead of letting a request unwind cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	args := flag.Args()
-	if len(args) == 0 {
-		usage()
+	// A dedicated FlagSet, not the package-level flag.CommandLine, so -h/--help
+	// can be routed to stdout+exit(0) below instead of flag's own default of
+	// stderr+exit(2): that default is right for a genuine usage error but
+	// wrong for someone deliberately asking for help. Output is discarded here
+	// so flag never prints on our behalf; both branches below print exactly
+	// once, to the stream the case calls for.
+	fs := flag.NewFlagSet("wi", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	profile := fs.String("profile", os.Getenv("WHATIFF_PROFILE"), "config profile to use")
+	asJSON := fs.Bool("json", false, "emit JSON instead of human-readable output")
+
+	switch err := fs.Parse(os.Args[1:]); {
+	case errors.Is(err, flag.ErrHelp):
+		// -h / -help / --help (flag treats one and two leading dashes the
+		// same): an explicit request for help, not a mistake. Exit 0.
+		usage(os.Stdout)
+		os.Exit(0)
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "wi: %v\n", err)
+		usage(os.Stderr)
 		os.Exit(2)
 	}
 
-	if err := run(context.Background(), args[0], args[1:], *profile, *asJSON); err != nil {
+	args := fs.Args()
+	if len(args) == 0 {
+		usage(os.Stderr)
+		os.Exit(2)
+	}
+	if args[0] == "help" {
+		usage(os.Stdout)
+		os.Exit(0)
+	}
+
+	if err := run(ctx, args[0], args[1:], *profile, *asJSON); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// Ctrl-C mid-request: the user asked for this, so it is not an
+			// error worth a scary wrapped message - just say so and leave
+			// with a non-zero status.
+			fmt.Fprintln(os.Stderr, "wi: cancelled")
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "wi: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `wi - WhatIff terminal client
+func usage(w io.Writer) {
+	fmt.Fprint(w, `wi - WhatIff terminal client
 
 Usage:
   wi [flags] <command> [args]
@@ -3853,16 +3923,154 @@ func newSession(profileName string) (*session, error) {
 }
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [ ] **Step 2: Write tests for the pure parts**
 
-Run: `go build ./cmd/whatiff-cli/`
-Expected: fails with `undefined: runLogin` and `undefined: runChats`. That is
-expected — Tasks 9 and 10 supply them. Do not commit yet.
+`loadProfile` is the one pure, easily-testable piece of this file — it
+forwards to `config.Load`/`config.Resolve`, both already covered, but
+`loadProfile` itself is what `newSession`, `runLogin`, and `runChats` all
+depend on, so its own contract (returns the *resolved* name, not the asked-for
+one; a bad `--profile` produces an actionable error) is worth pinning
+directly rather than only indirectly through those three.
+
+```go
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
+)
+
+// writeConfig points $XDG_CONFIG_HOME at a fresh temp dir for this test and
+// writes contents (if non-empty) to the whatiff/config.toml the config
+// package expects there.
+func writeConfig(t *testing.T, contents string) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if contents == "" {
+		return
+	}
+	dir, err := config.Dir()
+	if err != nil {
+		t.Fatalf("config.Dir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(contents), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+func TestLoadProfile_NoConfigFallsBackToLocalDefault(t *testing.T) {
+	writeConfig(t, "")
+
+	name, profile, err := loadProfile("")
+	if err != nil {
+		t.Fatalf("loadProfile: %v", err)
+	}
+	if name != config.DefaultProfileName {
+		t.Errorf("name = %q, want %q", name, config.DefaultProfileName)
+	}
+	if profile.APIURL != config.DefaultAPIURL {
+		t.Errorf("APIURL = %q, want %q", profile.APIURL, config.DefaultAPIURL)
+	}
+}
+
+func TestLoadProfile_ReturnsResolvedName(t *testing.T) {
+	writeConfig(t, `
+default_profile = "staging"
+
+[profiles.staging]
+api_url = "https://staging.example.com/api"
+`)
+
+	// Passing the empty name exercises the fallback-to-default chain; the
+	// resolved name it returns must be the one config.Resolve computed
+	// ("staging"), not the empty string that was asked for. loadProfile must
+	// not recompute this chain itself (see its doc comment) - this test
+	// pins that it forwards config.Resolve's return value.
+	name, profile, err := loadProfile("")
+	if err != nil {
+		t.Fatalf("loadProfile: %v", err)
+	}
+	if name != "staging" {
+		t.Errorf("name = %q, want %q", name, "staging")
+	}
+	if profile.APIURL != "https://staging.example.com/api" {
+		t.Errorf("APIURL = %q, want %q", profile.APIURL, "https://staging.example.com/api")
+	}
+}
+
+func TestLoadProfile_UnknownProfileIsActionable(t *testing.T) {
+	writeConfig(t, `
+[profiles.staging]
+api_url = "https://staging.example.com/api"
+`)
+
+	_, _, err := loadProfile("nope")
+	if err == nil {
+		t.Fatal("expected an error for an unknown profile, got nil")
+	}
+	// The error must name both the bad profile and what does exist, so a
+	// user can fix their --profile flag without going and reading
+	// config.toml themselves.
+	msg := err.Error()
+	if !strings.Contains(msg, "nope") {
+		t.Errorf("error %q does not mention the requested profile %q", msg, "nope")
+	}
+	if !strings.Contains(msg, "staging") {
+		t.Errorf("error %q does not list the available profile %q", msg, "staging")
+	}
+}
+```
+
+- [ ] **Step 3: Run the tests and verify the binary compiles**
+
+Run: `go test ./cmd/whatiff-cli/ -run TestLoadProfile -race -v && go build ./cmd/whatiff-cli/`
+Expected: the three `TestLoadProfile_*` tests pass; the build fails with
+`undefined: runLogin` and `undefined: runChats`. That is expected — Tasks 9
+and 10 supply them. Do not commit yet.
 
 ### Task 9: `wi login`
 
 **Files:**
 - Create: `cmd/whatiff-cli/login.go`
+- Test: `cmd/whatiff-cli/login_test.go`
+
+#### Why `promptLine` takes one shared `*bufio.Reader` instead of building its own
+
+An earlier version of `promptLine` did `bufio.NewReader(os.Stdin).ReadString('\n')`
+inline — a fresh `bufio.Reader` on every call. `bufio.Reader` reads ahead in
+chunks, so the first call's reader can buffer bytes from stdin past the
+newline it returns; a second, distinct `bufio.Reader` constructed for the next
+prompt starts with an empty buffer of its own and never sees those
+already-consumed bytes. Against a real interactive terminal this went
+unnoticed, because the terminal is itself line-buffered and delivers input one
+line at a time — the bug only shows up once stdin is piped or comes from a
+heredoc, where a multi-line answer can arrive in one `Read`. `runLogin` now
+constructs exactly one `*bufio.Reader` over `os.Stdin` and threads it through
+both the username and password-adjacent prompts; `promptLine`'s doc comment
+spells out why, so the fix doesn't get "simplified" back to the broken form.
+`TestPromptLine_SharedReaderSeesBothLines` is the regression test: it feeds
+one `*bufio.Reader` wrapping a two-line `strings.Reader` through two
+successive `promptLine` calls and asserts each returns its own line — the
+signature (`*bufio.Reader` in, not `io.Reader`) makes the fix structural: any
+implementation that re-wraps its argument in a fresh `bufio.NewReader` each
+call fails this test, since the wrapped `strings.Reader` gets fully drained on
+the first call.
+
+#### Why there is still no `--password` flag or env var
+
+Unchanged from the original design and repeated here because it's easy to
+"helpfully" add back under pressure to script `wi login`: a flag would put the
+password in shell history and in every process listing on the machine
+(`ps aux` on a shared box), matching the precedent in `cmd/create-superuser`.
+`promptPassword` requires a TTY (`term.IsTerminal`) and refuses otherwise —
+there is deliberately no way to feed it a password non-interactively.
 
 - [ ] **Step 1: Write the implementation**
 
@@ -3896,7 +4104,11 @@ func runLogin(ctx context.Context, profileName string) error {
 
 	fmt.Printf("Logging in to %s (profile %q)\n", profile.APIURL, name)
 
-	username, err := promptLine("Username or email: ")
+	// One shared reader for the whole prompt sequence - see promptLine's doc
+	// comment for why a fresh bufio.Reader per call is wrong.
+	stdin := bufio.NewReader(os.Stdin)
+
+	username, err := promptLine(stdin, "Username or email: ")
 	if err != nil {
 		return err
 	}
@@ -3935,10 +4147,23 @@ func runLogin(ctx context.Context, profileName string) error {
 	return nil
 }
 
-func promptLine(prompt string) (string, error) {
+// promptLine prints prompt, then reads one line from r.
+//
+// r must be a single *bufio.Reader shared across every prompt in a sequence -
+// never construct a fresh one per call. bufio.Reader reads ahead in chunks,
+// so the first call can buffer bytes past its newline into its own internal
+// buffer; a second, distinct bufio.Reader created for the next prompt starts
+// with an empty buffer of its own and never sees those already-consumed
+// bytes. Against a real interactive terminal this goes unnoticed because the
+// terminal itself is line-buffered and delivers input one line at a time, so
+// it happened to work "by luck" - but it silently drops input whenever stdin
+// is piped or comes from a heredoc (exactly the shape of the regression test
+// for this function). Do not "simplify" this back to bufio.NewReader(r) per
+// call.
+func promptLine(r *bufio.Reader, prompt string) (string, error) {
 	fmt.Print(prompt)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil {
+	line, err := r.ReadString('\n')
+	if err != nil && line == "" {
 		return "", fmt.Errorf("reading input: %w", err)
 	}
 	return strings.TrimSpace(line), nil
@@ -3961,15 +4186,133 @@ func promptPassword(prompt string) (string, error) {
 }
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [ ] **Step 2: Write the regression test for the reader-sharing fix**
 
-Run: `go build ./cmd/whatiff-cli/`
-Expected: still fails on `undefined: runChats` only. Task 10 finishes it.
+```go
+package main
+
+import (
+	"bufio"
+	"strings"
+	"testing"
+)
+
+// TestPromptLine_SharedReaderSeesBothLines is the regression test for
+// Correction 2: a *bufio.Reader created fresh on every promptLine call can
+// buffer bytes past the first newline and then discard them, since the next
+// call's reader starts with an empty buffer of its own. It fails against a
+// promptLine that does bufio.NewReader(r).ReadString('\n') internally on each
+// call, and passes when a single reader is threaded through both prompts.
+func TestPromptLine_SharedReaderSeesBothLines(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("alice\nswordfish\n"))
+
+	first, err := promptLine(r, "Username: ")
+	if err != nil {
+		t.Fatalf("first promptLine: %v", err)
+	}
+	if first != "alice" {
+		t.Errorf("first = %q, want %q", first, "alice")
+	}
+
+	second, err := promptLine(r, "Password: ")
+	if err != nil {
+		t.Fatalf("second promptLine: %v", err)
+	}
+	if second != "swordfish" {
+		t.Errorf("second = %q, want %q", second, "swordfish")
+	}
+}
+
+func TestPromptLine_TrimsWhitespace(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("  spaced out  \n"))
+	got, err := promptLine(r, "")
+	if err != nil {
+		t.Fatalf("promptLine: %v", err)
+	}
+	if got != "spaced out" {
+		t.Errorf("got %q, want %q", got, "spaced out")
+	}
+}
+
+// TestPromptLine_NoTrailingNewline covers input with no final newline (e.g.
+// the last line before EOF), which io.Reader.ReadString reports as an error
+// (io.EOF) alongside whatever it did manage to read.
+func TestPromptLine_NoTrailingNewline(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("noeol"))
+	got, err := promptLine(r, "")
+	if err != nil {
+		t.Fatalf("promptLine: %v", err)
+	}
+	if got != "noeol" {
+		t.Errorf("got %q, want %q", got, "noeol")
+	}
+}
+
+func TestPromptLine_EmptyInputErrors(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader(""))
+	_, err := promptLine(r, "")
+	if err == nil {
+		t.Fatal("expected an error reading from an empty/exhausted reader")
+	}
+}
+```
+
+- [ ] **Step 3: Run the tests and verify the binary compiles**
+
+Run: `go test ./cmd/whatiff-cli/ -run TestPromptLine -race -v && go build ./cmd/whatiff-cli/`
+Expected: the `TestPromptLine_*` tests pass; the build still fails on
+`undefined: runChats` only. Task 10 finishes it.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add cmd/whatiff-cli/main.go cmd/whatiff-cli/main_test.go cmd/whatiff-cli/login.go cmd/whatiff-cli/login_test.go
+git commit -m "feat(cli): wi login command"
+```
+
+This commit does not compile alone — `run` also dispatches to `runChats`,
+supplied by Task 10. That is expected; `go build ./...` is not green again
+until Task 10's commit lands.
 
 ### Task 10: `wi chats`
 
 **Files:**
 - Create: `cmd/whatiff-cli/chats.go`
+- Test: `cmd/whatiff-cli/chats_test.go`
+
+#### Why `runChats` prints a truncation notice and `--json` emits the whole `ChatPage`
+
+`ListChats` returns `ChatPage{Results, TotalCount}` specifically so a capped
+listing can be told apart from an account that only has that many chats (see
+`ChatPage`'s doc comment in `internal/cli/client/chat.go`) — but a command
+that decodes `page.Results` and prints only that throws the one piece of
+information `ChatPage` exists to carry straight back on the floor, one layer
+up from where Task 7 fixed the same failure inside the client. `runChats`
+pulls the decision into `truncationNotice(page client.ChatPage) string`,
+which returns `""` when nothing was cut off and otherwise a line like
+`Showing 100 of 347 chats. Use --limit to see more.`, printed after the table.
+`--json` mode encodes the whole `page`, not `page.Results`, so a script
+consuming `wi chats --json` has the same total available to it that the human
+table does.
+
+`truncationNotice` is pulled out of the print loop into its own function so
+this — the entire reason `ChatPage` carries `TotalCount` instead of a bare
+slice — has a table-driven test pinning it (`TestTruncationNotice`), rather
+than living as a couple of inline lines after the loop that a future edit
+could delete without anything noticing.
+
+#### Why `humanizeSince` gets a table-driven test across its bucket boundaries
+
+`humanizeSince` has four branches (`< time.Minute`, `< time.Hour`,
+`< 24*time.Hour`, else) each doing integer-truncating division
+(`int(d.Minutes())` etc.), which is exactly the kind of boundary logic that's
+easy to get off-by-one on and easy to leave untested since it "obviously
+works." `TestHumanizeSince` picks a duration comfortably inside each bucket
+(10s, 45m, 5h, 3d) plus one just past each lower boundary (90s, 90m, 25h) to
+pin the rounding-down behavior, rather than testing exact boundary instants —
+`time.Since` is evaluated against `time.Now()` at call time, so a test built
+on an exact `time.Minute`/`time.Hour` boundary would be one scheduler hiccup
+away from flaking onto the wrong side of it.
 
 - [ ] **Step 1: Write the implementation**
 
@@ -4007,7 +4350,7 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 		return err
 	}
 
-	chats, err := sess.client.ListChats(ctx, client.ListChatsOptions{
+	page, err := sess.client.ListChats(ctx, client.ListChatsOptions{
 		Archived: *archived,
 		Search:   *search,
 		Limit:    *limit,
@@ -4017,19 +4360,24 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 	}
 
 	if asJSON {
+		// The whole ChatPage, not a bare array of results: TotalCount is the
+		// entire reason ChatPage exists over []models.Chat (see its doc
+		// comment in internal/cli/client/chat.go) - a script parsing a bare
+		// array has no way to tell a capped listing from the complete one,
+		// which is exactly the ambiguity TotalCount exists to resolve.
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(chats)
+		return enc.Encode(page)
 	}
 
-	if len(chats) == 0 {
+	if len(page.Results) == 0 {
 		fmt.Println("No chats found.")
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tMODEL\tLAST MESSAGE\tUNREAD")
-	for _, c := range chats {
+	for _, c := range page.Results {
 		last := "-"
 		if c.LastMessageTime != nil {
 			last = humanizeSince(*c.LastMessageTime)
@@ -4044,7 +4392,29 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.Name, model, last, unread)
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	if notice := truncationNotice(page); notice != "" {
+		fmt.Println(notice)
+	}
+	return nil
+}
+
+// truncationNotice reports whether page's listing was capped by the caller's
+// limit and, if so, the line to print about it - e.g. "Showing 100 of 347
+// chats. Use --limit to see more." It returns "" when nothing was cut off.
+//
+// Pulled out of the print loop so the one thing TotalCount exists for (see
+// ChatPage's doc comment in internal/cli/client/chat.go) has a test pinning
+// it, rather than being a couple of inline lines a future edit could delete
+// without anything noticing.
+func truncationNotice(page client.ChatPage) string {
+	if page.TotalCount <= len(page.Results) {
+		return ""
+	}
+	return fmt.Sprintf("Showing %d of %d chats. Use --limit to see more.", len(page.Results), page.TotalCount)
 }
 
 // humanizeSince renders a coarse relative time. Chat listings are scanned, not
@@ -4065,16 +4435,110 @@ func humanizeSince(t time.Time) string {
 }
 ```
 
-- [ ] **Step 2: Verify the binary builds**
+- [ ] **Step 2: Write the tests**
 
-Run: `go build ./cmd/whatiff-cli/ && go vet ./cmd/whatiff-cli/ ./internal/cli/...`
-Expected: no output from either. The binary now compiles.
+```go
+package main
 
-- [ ] **Step 3: Commit**
+import (
+	"testing"
+	"time"
+
+	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
+	"github.com/theimaginaryfoundation/what-iff/internal/models"
+)
+
+func TestTruncationNotice(t *testing.T) {
+	tests := []struct {
+		name       string
+		results    int
+		totalCount int
+		want       string
+	}{
+		{"nothing truncated, counts equal", 3, 3, ""},
+		{"total unset (zero value), fewer than results is impossible so no notice", 3, 0, ""},
+		{"truncated", 100, 347, "Showing 100 of 347 chats. Use --limit to see more."},
+		{"truncated by one", 9, 10, "Showing 9 of 10 chats. Use --limit to see more."},
+		{"empty page, nothing to truncate", 0, 0, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			page := client.ChatPage{
+				Results:    make([]models.Chat, tt.results),
+				TotalCount: tt.totalCount,
+			}
+			got := truncationNotice(page)
+			if got != tt.want {
+				t.Errorf("truncationNotice() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHumanizeSince(t *testing.T) {
+	tests := []struct {
+		name string
+		ago  time.Duration
+		want string
+	}{
+		{"just now, no elapsed time", 0, "just now"},
+		{"just now, well under a minute", 10 * time.Second, "just now"},
+		{"a minute and a half rounds down to 1m", 90 * time.Second, "1m ago"},
+		{"comfortably minutes", 45 * time.Minute, "45m ago"},
+		{"an hour and a half rounds down to 1h", 90 * time.Minute, "1h ago"},
+		{"comfortably hours", 5 * time.Hour, "5h ago"},
+		{"a day and an hour rounds down to 1d", 25 * time.Hour, "1d ago"},
+		{"comfortably days", 3 * 24 * time.Hour, "3d ago"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := humanizeSince(time.Now().Add(-tt.ago))
+			if got != tt.want {
+				t.Errorf("humanizeSince(now-%v) = %q, want %q", tt.ago, got, tt.want)
+			}
+		})
+	}
+}
+```
+
+- [ ] **Step 3: Verify the binary builds and every test passes**
+
+Run: `go test ./cmd/whatiff-cli/ ./internal/cli/... -race && go vet ./cmd/whatiff-cli/ ./internal/cli/... && go build ./...`
+Expected: all tests pass, `go vet` and `go build` produce no output. The
+binary now compiles end to end.
+
+- [ ] **Step 4: Manually verify the binary's behavior**
+
+The binary has never been run interactively before this task; the tests above
+cover the pure logic, but exit codes, stdout/stderr routing, and the
+not-logged-in / unknown-profile / non-TTY-password error paths only show up by
+actually running it. Build it and check each of the following (no server
+needs to be running — Task 11 does the live end-to-end check against one):
 
 ```bash
-git add cmd/whatiff-cli/
-git commit -m "feat(cli): wi login and wi chats commands"
+go build -o bin/wi ./cmd/whatiff-cli
+./bin/wi                    # usage on stderr, exit 2
+./bin/wi --help              # usage on stdout, exit 0
+./bin/wi bogus                # unknown command error, exit 1
+./bin/wi chats                # not-logged-in error naming the profile and URL, exit 1
+./bin/wi --profile nope chats # unknown-profile error listing available profiles, exit 1
+echo "" | ./bin/wi login      # refuses without ever reaching an insecure password prompt, exit 1
+```
+
+Note on the last check: piping a single empty line supplies (and consumes)
+the *username* prompt's answer, so the observed failure is `username is
+required`, not `password entry requires an interactive terminal` — the
+TTY check never gets reached in that exact input shape. The TTY refusal is
+still real and reachable; confirm it separately by supplying a non-empty
+username and leaving the password prompt to hit non-TTY stdin, e.g.
+`printf 'alice\n' | ./bin/wi login`, which fails with `password entry
+requires an interactive terminal`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add cmd/whatiff-cli/chats.go cmd/whatiff-cli/chats_test.go
+git commit -m "feat(cli): wi chats command"
 ```
 
 ### Task 11: Makefile targets, package docs, and an end-to-end check
