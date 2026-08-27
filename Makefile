@@ -118,6 +118,17 @@ build-cli-crosscheck: ## Cross-compile the wi CLI for linux/darwin (build only, 
 	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
 	@echo "✅ wi cross-compiles for linux/darwin"
 
+.PHONY: build-cli
+build-cli: ## Build the wi CLI for this machine into ./bin/wi
+	@mkdir -p bin
+	@go build -o bin/wi ./cmd/whatiff-cli
+	@echo "✅ built ./bin/wi"
+
+.PHONY: install-cli
+install-cli: ## Install the wi CLI via 'go install' ($(GOPATH)/bin or $(GOBIN))
+	@go install ./cmd/whatiff-cli
+	@echo "✅ installed as 'whatiff-cli' (go install names the binary after its directory, cmd/whatiff-cli — symlink it to 'wi' on your PATH, e.g.: ln -s \$$(go env GOPATH)/bin/whatiff-cli \$$(go env GOPATH)/bin/wi)"
+
 .PHONY: install-hooks
 install-hooks: ## Install git pre-commit hook
 	@echo "Installing pre-commit hook..."
