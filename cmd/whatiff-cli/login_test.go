@@ -16,14 +16,14 @@ import (
 // and is exercised only by the milestone's live end-to-end check (see
 // docs/superpowers/plans/2026-08-27-whatiff-cli-foundation.md, Task 11).
 func TestRunLogin_HelpFlag(t *testing.T) {
-	err := runLogin(context.Background(), "", []string{"--help"})
+	err := runLogin(context.Background(), "", false, []string{"--help"})
 	if !errors.Is(err, errHelpRequested) {
 		t.Errorf("runLogin(--help) = %v, want errHelpRequested", err)
 	}
 }
 
 func TestRunLogin_UnexpectedArgument(t *testing.T) {
-	err := runLogin(context.Background(), "", []string{"extra", "--nonsense"})
+	err := runLogin(context.Background(), "", false, []string{"extra", "--nonsense"})
 	if !errors.Is(err, errFlagUsage) {
 		t.Errorf("runLogin(extra, --nonsense) = %v, want errFlagUsage", err)
 	}

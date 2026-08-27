@@ -25,7 +25,7 @@ milestone 2.
 
 - `main`, `run(ctx, command, args, profileName, asJSON)`.
 - `session`, `newSession(profileName)`, `loadProfile(profileName)`.
-- `runLogin(ctx, profileName, args)`, `runChats(ctx, profileName, asJSON, args)`.
+- `runLogin(ctx, profileName, asJSON, args)`, `runChats(ctx, profileName, asJSON, args)`.
 - `parseSubFlags`, `errHelpRequested`, `errFlagUsage` — shared subcommand
   flag-parsing that keeps `wi --help` and `wi chats --help` on the same
   stdout/exit-0 vs. stderr/exit-2 convention.
@@ -40,6 +40,18 @@ milestone 2.
 
 ## Non-obvious decisions
 
+- **`--profile` and `--json` are registered twice: once on main's top-level
+  FlagSet, once on each subcommand's.** `flag.FlagSet.Parse` stops at the
+  first non-flag argument, so the top-level FlagSet alone can only ever see
+  a global flag that precedes the subcommand name — `wi chats --json` failed
+  with "flag provided but not defined" despite being the design spec's own
+  documented usage (`docs/superpowers/specs/2026-08-27-whatiff-cli-design.md`).
+  Each subcommand's `fs.StringVar(&profileName, ...)`/`fs.BoolVar(&asJSON,
+  ...)` binds to the same variables the top-level parse already populated,
+  so a flag given after the subcommand simply overwrites that value — last
+  one given wins, regardless of which side of the subcommand name it's on.
+  `login` accepts `--json` even though it has no JSON output mode, purely so
+  both global flags behave identically after every subcommand.
 - **Interactive password entry only** (`login.go`) — no `--password` flag, no
   environment variable, matching `cmd/create-superuser`. A flag would put the
   password in shell history and in every process listing on the machine.

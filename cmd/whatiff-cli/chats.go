@@ -25,6 +25,19 @@ func runChats(ctx context.Context, profileName string, asJSON bool, args []strin
 	archived := fs.Bool("archived", false, "list archived chats instead of active ones")
 	search := fs.String("search", "", "filter by name or checkpoint summary")
 	limit := fs.Int("limit", defaultChatLimit, "maximum chats to return")
+	// --profile and --json are global flags (main.go's usage text says
+	// `wi [flags] <command>`), but flag.FlagSet.Parse stops at the first
+	// non-flag argument, so main's top-level FlagSet can only ever see
+	// flags that precede the subcommand name - `wi chats --json` used to
+	// fail with "flag provided but not defined", contradicting the design
+	// spec's own documented `wi chats --json | jq ...`. Registering them
+	// again here, bound to the same variables the top-level parse already
+	// populated, makes both orderings work: a flag given after "chats"
+	// simply overwrites the value the top-level parse set, so the
+	// last-given value wins regardless of which side of the subcommand
+	// name it's on.
+	fs.StringVar(&profileName, "profile", profileName, "config profile to use")
+	fs.BoolVar(&asJSON, "json", asJSON, "emit JSON instead of human-readable output")
 	if err := parseSubFlags(fs, args); err != nil {
 		return err
 	}

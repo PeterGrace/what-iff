@@ -129,3 +129,62 @@ func TestRun_DispatchesToChats(t *testing.T) {
 		t.Errorf("run(chats, --archived) error = %q, want a not-logged-in error", err.Error())
 	}
 }
+
+// TestRun_ChatsAcceptsProfileFlagAfterSubcommand pins the fix for `wi chats
+// --profile foo` (and `wi chats --json`) previously failing with "flag
+// provided but not defined": --profile is registered on chats' own FlagSet,
+// not just main's top-level one, so a value given after "chats" is accepted
+// at all — this test's substantive assertion is that run() doesn't return
+// errFlagUsage, which is what "not defined" would have produced before the
+// fix. loadProfile still fails past that point (no such profile in an empty
+// config), which is expected and not what's under test here.
+func TestRun_ChatsAcceptsProfileFlagAfterSubcommand(t *testing.T) {
+	writeConfig(t, "")
+
+	err := run(context.Background(), "chats", []string{"--profile", "nonesuch"}, "", false)
+	if errors.Is(err, errFlagUsage) {
+		t.Fatalf("run(chats, --profile nonesuch) = %v, want --profile accepted as a known flag on chats' own FlagSet", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "nonesuch") {
+		t.Errorf("run(chats, --profile nonesuch) error = %v, want it to name the requested profile %q", err, "nonesuch")
+	}
+}
+
+// TestRun_SubcommandProfileFlagOverridesTopLevel pins the "last one wins"
+// resolution promised by chats.go's runChats doc comment: --profile is
+// registered on both main's top-level FlagSet and chats' own, bound to the
+// same variable, so a value given after "chats" must win over one given
+// before it (they can't both apply - the variable holds one string). The
+// resulting "no profile named" error names whichever profile actually took
+// effect, so asserting which name appears in it is a direct test of which
+// flag won.
+func TestRun_SubcommandProfileFlagOverridesTopLevel(t *testing.T) {
+	writeConfig(t, "")
+
+	err := run(context.Background(), "chats", []string{"--profile", "from-subcommand"}, "from-top-level", false)
+	if err == nil {
+		t.Fatal("run(...) = nil, want an error naming the unknown profile")
+	}
+	if !strings.Contains(err.Error(), "from-subcommand") {
+		t.Errorf("error = %q, want it to name %q (the subcommand-level flag, which must win)", err.Error(), "from-subcommand")
+	}
+	if strings.Contains(err.Error(), "from-top-level") {
+		t.Errorf("error = %q, unexpectedly still names the top-level value %q, which the subcommand flag should have overridden", err.Error(), "from-top-level")
+	}
+}
+
+// TestRun_TopLevelProfileFlagAppliesWhenSubcommandOmitsIt pins the other
+// half of the same contract: when the subcommand doesn't repeat --profile,
+// the value the top-level parse already set must survive untouched into
+// runChats, not get reset to chats' own FlagSet default ("").
+func TestRun_TopLevelProfileFlagAppliesWhenSubcommandOmitsIt(t *testing.T) {
+	writeConfig(t, "")
+
+	err := run(context.Background(), "chats", nil, "from-top-level", false)
+	if err == nil {
+		t.Fatal("run(...) = nil, want an error naming the unknown profile")
+	}
+	if !strings.Contains(err.Error(), "from-top-level") {
+		t.Errorf("error = %q, want it to name %q (the top-level flag, unmodified by chats' own FlagSet)", err.Error(), "from-top-level")
+	}
+}

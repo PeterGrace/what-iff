@@ -21,17 +21,26 @@ import (
 // would put the password in shell history and in every process listing on the
 // machine.
 //
-// login takes no flags and no positional arguments, but it still runs its
-// args through an empty FlagSet via parseSubFlags rather than dropping them
-// on the floor: without this, `wi login --help` silently started an
+// login takes no flags of its own and no positional arguments, but it still
+// runs its args through a FlagSet via parseSubFlags rather than dropping
+// them on the floor: without this, `wi login --help` silently started an
 // interactive login prompt instead of printing usage, and `wi login extra
 // --nonsense` silently ignored both instead of erroring — the same
 // stdout/exit-0 (help) and stderr/exit-2 (bad usage) convention chats
 // already follows was simply never wired up for this command. NArg() is
 // checked explicitly afterward because flag.FlagSet does not itself reject
 // leftover positional arguments (it just stops parsing at the first one).
-func runLogin(ctx context.Context, profileName string, args []string) error {
+//
+// --profile and --json are registered here too (bound to the same variables
+// main's top-level parse already populated) purely so `wi login --profile
+// foo` works after the subcommand name, matching chats — see chats.go's
+// runChats for why. asJSON has no effect on login's output; it is accepted
+// rather than rejected only so the two global flags behave identically
+// regardless of which subcommand follows them.
+func runLogin(ctx context.Context, profileName string, asJSON bool, args []string) error {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	fs.StringVar(&profileName, "profile", profileName, "config profile to use")
+	fs.BoolVar(&asJSON, "json", asJSON, "emit JSON instead of human-readable output (unused by login)")
 	if err := parseSubFlags(fs, args); err != nil {
 		return err
 	}

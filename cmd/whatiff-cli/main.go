@@ -152,7 +152,7 @@ func printSubUsage(fs *flag.FlagSet, w io.Writer) {
 func run(ctx context.Context, command string, args []string, profileName string, asJSON bool) error {
 	switch command {
 	case "login":
-		return runLogin(ctx, profileName, args)
+		return runLogin(ctx, profileName, asJSON, args)
 	case "chats":
 		return runChats(ctx, profileName, asJSON, args)
 	default:
