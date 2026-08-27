@@ -273,15 +273,3 @@ func TestResolveDoesNotMutateConfig(t *testing.T) {
 		t.Errorf("cfg.Profiles[\"local\"].APIURL = %q, want unchanged empty string", cfg.Profiles["local"].APIURL)
 	}
 }
-
-func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	path, err := DefaultPath()
-	if err != nil {
-		t.Fatalf("DefaultPath returned %v", err)
-	}
-	want := filepath.Join("whatiff", "config.toml")
-	if !strings.HasSuffix(path, want) {
-		t.Errorf("DefaultPath() = %q, want suffix %q", path, want)
-	}
-}

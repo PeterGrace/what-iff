@@ -37,7 +37,8 @@ what the engine's event stream turns out to feel like in practice.
 
 | File | Responsibility |
 |---|---|
-| `internal/cli/config/config.go` | TOML config, profile resolution, XDG paths |
+| `internal/cli/config/config.go` | TOML config, profile resolution |
+| `internal/cli/config/paths.go` | XDG config dir and default config path |
 | `internal/cli/config/credentials.go` | Per-profile token storage, `0600`, atomic writes |
 | `internal/cli/config/_PACKAGE_SUMMARY.md` | Package docs (repo anti-drift rule) |
 | `internal/cli/client/client.go` | Base HTTP client, typed errors, 401 refresh |
@@ -391,7 +392,9 @@ git commit -m "feat(cli): config profile resolution"
 
 **Files:**
 - Modify: `internal/cli/config/config.go`
+- Create: `internal/cli/config/paths.go`
 - Test: `internal/cli/config/config_test.go`
+- Test: `internal/cli/config/paths_test.go`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -508,6 +511,28 @@ apiurl = "https://whatiff.chat/api"
 	}
 }
 
+```
+
+IMPORTANT: `strings` was already added to the test file's import block by
+Task 1 (its `Resolve` error-message tests need it) — merge these new tests
+into the existing `os` / `path/filepath` / `strings` / `testing` block rather
+than adding a second import statement.
+
+`Dir` and `DefaultPath` and their test live in their own file rather than in
+`config.go`/`config_test.go`: path discovery is a separate responsibility from
+TOML parsing, and Task 3 gives it a second consumer (`DefaultCredentialStore`),
+so it earns its own file from the start. Create
+`internal/cli/config/paths_test.go`:
+
+```go
+package config
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
 func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
 	// os.UserConfigDir errors if neither XDG_CONFIG_HOME nor HOME is set —
 	// true in a minimal container even though CI's ambient HOME hides it.
@@ -524,11 +549,6 @@ func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
 }
 ```
 
-IMPORTANT: `strings` was already added to the test file's import block by
-Task 1 (its `Resolve` error-message tests need it) — merge these new tests
-into the existing `os` / `path/filepath` / `strings` / `testing` block rather
-than adding a second import statement.
-
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/cli/config/ -run TestLoad -v`
@@ -537,8 +557,8 @@ Expected: FAIL — `undefined: Load`.
 - [ ] **Step 3: Write minimal implementation**
 
 Add to `internal/cli/config/config.go` (and extend the import block to
-`"errors"`, `"fmt"`, `"net/url"`, `"os"`, `"path/filepath"`, `"sort"`,
-`"strings"`, and `"github.com/BurntSushi/toml"`):
+`"errors"`, `"fmt"`, `"net/url"`, `"os"`, `"sort"`, `"strings"`, and
+`"github.com/BurntSushi/toml"`):
 
 ```go
 // Load reads a config file. A missing file is not an error: the CLI is usable
@@ -570,6 +590,18 @@ func Load(path string) (Config, error) {
 	}
 	return cfg, nil
 }
+```
+
+Create `internal/cli/config/paths.go`:
+
+```go
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
 
 // Dir is the CLI's configuration directory: the OS user config directory
 // (XDG_CONFIG_HOME on Linux) plus a whatiff/ component.
