@@ -174,6 +174,21 @@ func TestResolveRejectsAPIURLWithoutScheme(t *testing.T) {
 	}
 }
 
+func TestResolveTrimsAPIURLWhitespace(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"hosted": {APIURL: "  http://localhost:8080/api  "},
+		},
+	}
+	_, p, err := cfg.Resolve("hosted")
+	if err != nil {
+		t.Fatalf("Resolve(\"hosted\") returned %v", err)
+	}
+	if p.APIURL != "http://localhost:8080/api" {
+		t.Errorf("APIURL = %q, want trimmed %q", p.APIURL, "http://localhost:8080/api")
+	}
+}
+
 func TestResolveErrorListsAvailableProfiles(t *testing.T) {
 	cfg := Config{
 		Profiles: map[string]Profile{
@@ -293,42 +308,56 @@ func (c Config) Resolve(name string) (string, Profile, error) {
 		name = DefaultProfileName
 	}
 
-	if p, ok := c.Profiles[name]; ok {
+	// p ends up holding the candidate profile from whichever branch below
+	// applies; validateAPIURL is then called exactly once, so the builtin
+	// local default (used by both the found-profile and no-profiles-at-all
+	// branches) is validated the same way a declared profile is.
+	p, ok := c.Profiles[name]
+	switch {
+	case ok:
 		if p.APIURL == "" {
 			if name != DefaultProfileName {
 				return "", Profile{}, fmt.Errorf("profile %q has no api_url", name)
 			}
 			p.APIURL = DefaultAPIURL
 		}
-		if err := validateAPIURL(name, p.APIURL); err != nil {
-			return "", Profile{}, err
-		}
-		return name, p, nil
-	}
-	if len(c.Profiles) == 0 && name == DefaultProfileName {
-		return name, Profile{APIURL: DefaultAPIURL}, nil
-	}
-	if asked == "" && c.DefaultProfile == "" {
+	case len(c.Profiles) == 0 && name == DefaultProfileName:
+		p = Profile{APIURL: DefaultAPIURL}
+	case asked == "" && c.DefaultProfile == "":
 		return "", Profile{}, fmt.Errorf("no default_profile set and no profile named %q (available: %s)", name, c.profileNames())
+	default:
+		return "", Profile{}, fmt.Errorf("no profile named %q (available: %s)", name, c.profileNames())
 	}
-	return "", Profile{}, fmt.Errorf("no profile named %q (available: %s)", name, c.profileNames())
+
+	cleaned, err := validateAPIURL(name, p.APIURL)
+	if err != nil {
+		return "", Profile{}, err
+	}
+	p.APIURL = cleaned
+	return name, p, nil
 }
 
 // validateAPIURL rejects a profile URL that net/http could not use, at the one
 // chokepoint where the profile name is still known. Without this the failure
-// surfaces later as an opaque transport error naming no profile.
-func validateAPIURL(name, raw string) error {
+// surfaces later as an opaque transport error naming no profile. It returns
+// the trimmed URL: ordinary whitespace around api_url in config.toml would
+// otherwise reach net/http unexamined — a trailing space is silently accepted
+// and turns into a literal %20 in the request path, and a leading space
+// produces the unrelated-looking error "first path segment in URL cannot
+// contain colon". Callers must use the returned string, not raw.
+func validateAPIURL(name, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("profile %q has an invalid api_url %q: %w", name, raw, err)
+		return "", fmt.Errorf("profile %q has an invalid api_url %q: %w", name, raw, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("profile %q api_url %q must start with http:// or https://", name, raw)
+		return "", fmt.Errorf("profile %q api_url %q must start with http:// or https://", name, raw)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("profile %q api_url %q has no host", name, raw)
+		return "", fmt.Errorf("profile %q api_url %q has no host", name, raw)
 	}
-	return nil
+	return raw, nil
 }
 
 // profileNames lists configured profile names for error messages, sorted so the
@@ -437,22 +466,53 @@ func TestLoadMalformedTOMLErrors(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownKeys(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.toml")
-	body := `defaultprofile = "hosted"`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name    string
+		body    string
+		wantKey string
+	}{
+		{
+			name:    "top-level typo",
+			body:    `defaultprofile = "hosted"`,
+			wantKey: "defaultprofile",
+		},
+		{
+			// The scenario the api_url docs actually cite: nested-table
+			// unification is exactly what toml.Unmarshal would silently
+			// absorb, which is why Load uses toml.Decode + Undecoded()
+			// instead.
+			name: "nested typo inside a profile table",
+			body: `
+[profiles.hosted]
+apiurl = "https://whatiff.chat/api"
+`,
+			wantKey: "profiles.hosted.apiurl",
+		},
 	}
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("Load returned nil error, want error")
-	}
-	if !strings.Contains(err.Error(), "defaultprofile") {
-		t.Errorf("error = %q, want it to name the offending key", err.Error())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load returned nil error, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantKey) {
+				t.Errorf("error = %q, want it to name the offending key %q", err.Error(), tt.wantKey)
+			}
+		})
 	}
 }
 
 func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
+	// os.UserConfigDir errors if neither XDG_CONFIG_HOME nor HOME is set —
+	// true in a minimal container even though CI's ambient HOME hides it.
+	// Pinning XDG_CONFIG_HOME keeps this test hermetic and deterministic.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	path, err := DefaultPath()
 	if err != nil {
 		t.Fatalf("DefaultPath returned %v", err)

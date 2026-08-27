@@ -47,7 +47,7 @@ type Config struct {
 // The empty-api_url convenience default applies ONLY to the builtin local
 // profile name. Any other profile with a missing or malformed api_url is
 // rejected here rather than silently resolving to localhost: once a profile
-// is misconfigured (e.g. a `apiurl` typo that leaves `api_url` unset),
+// is misconfigured (e.g. an `apiurl` typo that leaves `api_url` unset),
 // falling back to the local default would mean credentials meant for a
 // hosted server end up sent to whatever is listening on localhost instead.
 //
@@ -63,42 +63,56 @@ func (c Config) Resolve(name string) (string, Profile, error) {
 		name = DefaultProfileName
 	}
 
-	if p, ok := c.Profiles[name]; ok {
+	// p ends up holding the candidate profile from whichever branch below
+	// applies; validateAPIURL is then called exactly once, so the builtin
+	// local default (used by both the found-profile and no-profiles-at-all
+	// branches) is validated the same way a declared profile is.
+	p, ok := c.Profiles[name]
+	switch {
+	case ok:
 		if p.APIURL == "" {
 			if name != DefaultProfileName {
 				return "", Profile{}, fmt.Errorf("profile %q has no api_url", name)
 			}
 			p.APIURL = DefaultAPIURL
 		}
-		if err := validateAPIURL(name, p.APIURL); err != nil {
-			return "", Profile{}, err
-		}
-		return name, p, nil
-	}
-	if len(c.Profiles) == 0 && name == DefaultProfileName {
-		return name, Profile{APIURL: DefaultAPIURL}, nil
-	}
-	if asked == "" && c.DefaultProfile == "" {
+	case len(c.Profiles) == 0 && name == DefaultProfileName:
+		p = Profile{APIURL: DefaultAPIURL}
+	case asked == "" && c.DefaultProfile == "":
 		return "", Profile{}, fmt.Errorf("no default_profile set and no profile named %q (available: %s)", name, c.profileNames())
+	default:
+		return "", Profile{}, fmt.Errorf("no profile named %q (available: %s)", name, c.profileNames())
 	}
-	return "", Profile{}, fmt.Errorf("no profile named %q (available: %s)", name, c.profileNames())
+
+	cleaned, err := validateAPIURL(name, p.APIURL)
+	if err != nil {
+		return "", Profile{}, err
+	}
+	p.APIURL = cleaned
+	return name, p, nil
 }
 
 // validateAPIURL rejects a profile URL that net/http could not use, at the one
 // chokepoint where the profile name is still known. Without this the failure
-// surfaces later as an opaque transport error naming no profile.
-func validateAPIURL(name, raw string) error {
+// surfaces later as an opaque transport error naming no profile. It returns
+// the trimmed URL: ordinary whitespace around api_url in config.toml would
+// otherwise reach net/http unexamined — a trailing space is silently accepted
+// and turns into a literal %20 in the request path, and a leading space
+// produces the unrelated-looking error "first path segment in URL cannot
+// contain colon". Callers must use the returned string, not raw.
+func validateAPIURL(name, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("profile %q has an invalid api_url %q: %w", name, raw, err)
+		return "", fmt.Errorf("profile %q has an invalid api_url %q: %w", name, raw, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("profile %q api_url %q must start with http:// or https://", name, raw)
+		return "", fmt.Errorf("profile %q api_url %q must start with http:// or https://", name, raw)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("profile %q api_url %q has no host", name, raw)
+		return "", fmt.Errorf("profile %q api_url %q has no host", name, raw)
 	}
-	return nil
+	return raw, nil
 }
 
 // profileNames lists configured profile names for error messages, sorted so the

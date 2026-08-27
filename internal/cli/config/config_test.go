@@ -106,6 +106,8 @@ func TestLoadMissingFileIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve returned %v", err)
 	}
+	// Hardcoded rather than compared against DefaultAPIURL: hardcoding here is
+	// what would catch an accidental change to the constant.
 	if p.APIURL != "http://localhost:8080/api" {
 		t.Errorf("APIURL = %q, want the builtin default", p.APIURL)
 	}
@@ -169,6 +171,21 @@ func TestResolveRejectsAPIURLWithoutScheme(t *testing.T) {
 	}
 }
 
+func TestResolveTrimsAPIURLWhitespace(t *testing.T) {
+	cfg := Config{
+		Profiles: map[string]Profile{
+			"hosted": {APIURL: "  http://localhost:8080/api  "},
+		},
+	}
+	_, p, err := cfg.Resolve("hosted")
+	if err != nil {
+		t.Fatalf("Resolve(\"hosted\") returned %v", err)
+	}
+	if p.APIURL != "http://localhost:8080/api" {
+		t.Errorf("APIURL = %q, want trimmed %q", p.APIURL, "http://localhost:8080/api")
+	}
+}
+
 func TestResolveErrorListsAvailableProfiles(t *testing.T) {
 	cfg := Config{
 		Profiles: map[string]Profile{
@@ -201,18 +218,45 @@ func TestResolveNoDefaultProfileErrorIsSpecific(t *testing.T) {
 }
 
 func TestLoadRejectsUnknownKeys(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.toml")
-	body := `defaultprofile = "hosted"`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name    string
+		body    string
+		wantKey string
+	}{
+		{
+			name:    "top-level typo",
+			body:    `defaultprofile = "hosted"`,
+			wantKey: "defaultprofile",
+		},
+		{
+			// The scenario the api_url docs actually cite: nested-table
+			// unification is exactly what toml.Unmarshal would silently
+			// absorb, which is why Load uses toml.Decode + Undecoded()
+			// instead.
+			name: "nested typo inside a profile table",
+			body: `
+[profiles.hosted]
+apiurl = "https://whatiff.chat/api"
+`,
+			wantKey: "profiles.hosted.apiurl",
+		},
 	}
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("Load returned nil error, want error")
-	}
-	if !strings.Contains(err.Error(), "defaultprofile") {
-		t.Errorf("error = %q, want it to name the offending key", err.Error())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load returned nil error, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantKey) {
+				t.Errorf("error = %q, want it to name the offending key %q", err.Error(), tt.wantKey)
+			}
+		})
 	}
 }
 
@@ -231,6 +275,7 @@ func TestResolveDoesNotMutateConfig(t *testing.T) {
 }
 
 func TestDefaultPathEndsWithWhatiffConfigToml(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	path, err := DefaultPath()
 	if err != nil {
 		t.Fatalf("DefaultPath returned %v", err)
