@@ -17,7 +17,7 @@
 - `make vet` — static analysis; `make test` — run Go tests; `make build` — verify the build (cross-compiles a throwaway `linux/amd64` binary; the `bootstrap` output name is a legacy artifact of the retired Lambda target).
 - `make tidy` — check `go.mod`/`go.sum` are tidy; `make test-short` — tests without verbose output.
 - `make generate` — regenerate Ent code after schema changes.
-- `make pre-commit` — run all pre-commit checks (`fmt vet tidy test build check-no-local-models`). CI runs the same formatting/vet/tidy/build checks but regenerates Ent code first and uses `make test-ci` (mock LLM, dummy keys, race detector) as its test gate; the frontend is validated by its own `frontend-pr-validation` workflow. Passing locally is a strong signal, not a guarantee.
+- `make pre-commit` — run all pre-commit checks (`fmt vet tidy test build build-cli-crosscheck check-no-local-models check-compose-defaults check-public-hygiene`). CI runs the same formatting/vet/tidy/build/CLI-crosscompile checks but regenerates Ent code first and uses `make test-ci` (mock LLM, dummy keys, race detector) as its test gate; the frontend is validated by its own `frontend-pr-validation` workflow. Passing locally is a strong signal, not a guarantee.
 - Frontend: `cd web/app && npm install && npm start`.
 - Docker stack: `docker compose up --build`.
 - **CI stays on `make` wherever a target exists.** A workflow step must not

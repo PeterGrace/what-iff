@@ -111,12 +111,27 @@ build: $(ENT_SENTINEL) ## Verify build works
 	@echo "✅ Build successful"
 
 .PHONY: build-cli-crosscheck
-build-cli-crosscheck: ## Cross-compile the wi CLI for linux/darwin (build only, catches platform-specific build-tag mistakes like a file name that silently narrows its own //go:build line)
-	@echo "Cross-compiling cmd/whatiff-cli for linux/amd64, darwin/amd64, darwin/arm64..."
+# linux/aix/solaris share the "linux || aix || solaris" build tag on the
+# TCFLSH ioctl file (see cmd/whatiff-cli's tty_tcflsh.go and its
+# _PACKAGE_SUMMARY.md for the tty_linux.go filename trap this target exists
+# to catch) - aix and solaris are included here, not just linux, because a
+# filename-implied build constraint narrowing that tag silently would
+# otherwise only be caught by actually compiling for them. freebsd and
+# illumos exercise the BSD-ioctl (tty_bsd.go) and no-op (tty_other.go) paths
+# respectively; windows exercises tty_other.go on a wholly different OS
+# family. All five plus linux/darwin were confirmed to build during the
+# milestone 1 whole-milestone review.
+build-cli-crosscheck: ## Cross-compile the wi CLI for every supported platform (build only, catches platform-specific build-tag mistakes like a file name that silently narrows its own //go:build line)
+	@echo "Cross-compiling cmd/whatiff-cli for linux/amd64, darwin/amd64, darwin/arm64, freebsd/amd64, solaris/amd64, illumos/amd64, aix/ppc64, windows/amd64..."
 	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
 	@GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
 	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
-	@echo "✅ wi cross-compiles for linux/darwin"
+	@GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=solaris GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=illumos GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=aix GOARCH=ppc64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@echo "✅ wi cross-compiles for linux, darwin, freebsd, solaris, illumos, aix, windows"
 
 .PHONY: build-cli
 build-cli: ## Build the wi CLI for this machine into ./bin/wi
