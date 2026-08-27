@@ -234,6 +234,28 @@ func TestRefreshSurvivesLeaderPanic(t *testing.T) {
 	}
 }
 
+// TestRefreshSurvivesLeaderPanicWithoutDiscardingTokens pins the `r == nil`
+// guard in the leader's deferred cleanup (see refreshTokens). Without that
+// guard, a leader panic still reaches the "adopt tokens" branch: err is
+// still nil (nothing ever assigned it), so a zero-valued resp gets adopted
+// and the client's tokens silently become Tokens{} — discarding the user's
+// session deterministically, with every other test in this package still
+// green. This asserts the original tokens survive a leader panic intact.
+func TestRefreshSurvivesLeaderPanicWithoutDiscardingTokens(t *testing.T) {
+	want := Tokens{Access: "acc-1", Refresh: "ref-1"}
+	c := New("http://example.invalid", want)
+	c.HTTP = &http.Client{Transport: panicRoundTripper{}}
+
+	func() {
+		defer func() { recover() }()
+		c.refreshTokens(context.Background(), "acc-1")
+	}()
+
+	if got := c.Tokens(); got != want {
+		t.Errorf("tokens after leader panic = %+v, want unchanged %+v", got, want)
+	}
+}
+
 // TestRefreshTwoSequentialGenerationsBothReachServer pins c.inflight being
 // cleared after a completed refresh: if it weren't, a second caller — even
 // one reporting a genuinely newer stale token — would find c.inflight still

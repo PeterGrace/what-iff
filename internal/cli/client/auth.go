@@ -115,6 +115,11 @@ func (c *Client) refreshTokens(ctx context.Context, staleAccess string) (bool, e
 				c.tokens = updated
 			}
 			c.mu.Unlock()
+			// close(done) must come after token adoption above, not before:
+			// a waiter unblocks the instant this fires, and it infers success
+			// by reading c.tokens — if that read could happen before the
+			// write, a waiter could see the pre-refresh token and wrongly
+			// report failure.
 			close(done)
 			if r != nil {
 				panic(r)

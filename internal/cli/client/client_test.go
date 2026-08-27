@@ -894,6 +894,41 @@ func TestDoCancellationDuringRefreshSurfacesAsContextError(t *testing.T) {
 	}
 }
 
+// TestDoRefreshLeaderContextDeadlineSurfacesAsContextError pins the same
+// client.go switch as the waiter test above, but through the simpler leader
+// path: no second goroutine involved, just the leader's own refresh request
+// outliving its caller's deadline. refreshTokens' doJSON call then returns a
+// wrapped context.DeadlineExceeded directly (not via the select's ctx.Done()
+// branch), and do must still surface it as itself rather than as the 401
+// that triggered the refresh.
+func TestDoRefreshLeaderContextDeadlineSurfacesAsContextError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			// Slower than the context deadline below, so the leader's own
+			// doJSON call times out before the server responds.
+			time.Sleep(200 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"Unauthorized"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := c.do(ctx, http.MethodGet, "/thing", nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want errors.Is(err, context.DeadlineExceeded) = true", err)
+	}
+}
+
 // TestDoDoesNotRetryWhenRefreshFails pins client.go's !refreshed branch
 // returning without a second doJSON call: when the refresh itself fails,
 // there is no new token to retry with, so the protected endpoint must be
