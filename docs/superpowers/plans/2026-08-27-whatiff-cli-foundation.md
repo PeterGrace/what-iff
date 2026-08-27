@@ -1225,6 +1225,8 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1294,6 +1296,63 @@ func TestDoJSONNonJSONErrorBodyStillReports(t *testing.T) {
 		t.Errorf("Status = %d, want 502", apiErr.Status)
 	}
 }
+
+func TestDoJSONSendsBodyAndContentType(t *testing.T) {
+	type payload struct {
+		Message string `json:"message"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+		var got payload
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decoding request body: %v", err)
+		}
+		if got.Message != "hello" {
+			t.Errorf("request body Message = %q, want hello", got.Message)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodPost, "/thing", payload{Message: "hello"}, nil)
+	if err != nil {
+		t.Fatalf("doJSON returned %v", err)
+	}
+}
+
+func TestDoJSONNilOutDiscardsBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"name":"deploy plan"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
+		t.Fatalf("doJSON returned %v", err)
+	}
+}
+
+func TestDoJSONNoTokenOmitsAuthorizationHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{})
+	if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
+		t.Fatalf("doJSON returned %v", err)
+	}
+}
 ```
 
 The test file's import block is:
@@ -1301,6 +1360,7 @@ The test file's import block is:
 ```go
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -1394,7 +1454,7 @@ func (c *Client) accessToken() string {
 }
 
 // doJSON performs one request with no refresh handling. Callers that need
-// transparent re-auth use do (Task 6).
+// transparent re-auth use do (added in the next task).
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
 	var reader io.Reader
 	if body != nil {
@@ -1403,6 +1463,13 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 			return fmt.Errorf("encoding request body: %w", err)
 		}
 		reader = bytes.NewReader(encoded)
+	}
+
+	// A caller that passes "chat" instead of "/chat" would otherwise silently
+	// build c.BaseURL + path into a wrong URL (e.g. ".../apichat"); normalize
+	// so a missing leading slash can't produce a wrong-but-valid request.
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, reader)
@@ -1423,10 +1490,10 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return decodeAPIError(resp)
+		return fmt.Errorf("%s %s: %w", method, path, decodeAPIError(resp))
 	}
 	if out == nil {
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -1441,6 +1508,9 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 func decodeAPIError(resp *http.Response) error {
 	apiErr := &APIError{Status: resp.StatusCode}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	// The body may exceed the 64KB cap; drain the remainder so the
+	// connection's transport can be reused instead of forcing a close.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	if err != nil {
 		return apiErr
 	}
@@ -1459,7 +1529,7 @@ func decodeAPIError(resp *http.Response) error {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/cli/client/ -v`
-Expected: PASS, three tests.
+Expected: PASS, six tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1467,6 +1537,38 @@ Expected: PASS, three tests.
 git add internal/cli/client/client.go internal/cli/client/client_test.go
 git commit -m "feat(cli): base HTTP client with typed API errors"
 ```
+
+#### Why `doJSON` wraps `decodeAPIError` with the endpoint
+
+`decodeAPIError`'s own `*APIError.Error()` string carries no endpoint — a bare
+`free tier message limit reached (HTTP 403)` gives a CLI user, who has no
+network tab, nothing to say which request failed. `doJSON` wraps the returned
+error with `fmt.Errorf("%s %s: %w", method, path, decodeAPIError(resp))`,
+matching how the transport-error and decode-error paths already report the
+method and path. This does not change `*APIError`'s fields or defeat
+`errors.As(err, &apiErr)`: `%w` still chains through to the `*APIError`
+beneath, so `apiErr.Status`, `apiErr.Code`, and `apiErr.Message` are unaffected
+and the three originally-specified tests pass unmodified.
+
+#### Why `decodeAPIError` drains the body after its limited read
+
+`io.ReadAll(io.LimitReader(resp.Body, 64<<10))` stops at 64KB. If the actual
+body is larger, the unread remainder is left on the connection, and
+`net/http` cannot reuse that connection for a future request — every
+oversized error response would otherwise force a fresh TCP (and TLS)
+handshake. `decodeAPIError` follows the limited read with
+`_, _ = io.Copy(io.Discard, resp.Body)` to drain whatever is left, discarding
+both return values since a failure to drain leaves the connection merely
+unreusable, not the request itself in error.
+
+#### Why `doJSON` normalizes a missing leading slash
+
+`c.BaseURL + path` is a plain string concatenation. A caller that passes
+`"chat"` instead of `"/chat"` would build `.../apichat` instead of
+`.../api/chat` — a wrong URL that still parses, so nothing catches the typo
+until the server 404s in a confusing way. `doJSON` prepends `/` when `path`
+doesn't already start with one, so the concatenation is correct regardless of
+how a call site spells its path.
 
 ### Task 5: Login and refresh calls
 
