@@ -1224,12 +1224,17 @@ error).
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestDoJSONDecodesSuccess(t *testing.T) {
@@ -1308,7 +1313,12 @@ func TestDoJSONSendsBodyAndContentType(t *testing.T) {
 		}
 		var got payload
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-			t.Fatalf("decoding request body: %v", err)
+			// t.Fatalf from a handler goroutine cannot stop the test the way
+			// it would from the test goroutine itself (FailNow requires
+			// running on the test's own goroutine); report and bail out of
+			// this handler invocation instead.
+			t.Errorf("decoding request body: %v", err)
+			return
 		}
 		if got.Message != "hello" {
 			t.Errorf("request body Message = %q, want hello", got.Message)
@@ -1325,16 +1335,34 @@ func TestDoJSONSendsBodyAndContentType(t *testing.T) {
 	}
 }
 
+// TestDoJSONNilOutDiscardsBody pins the out==nil drain by observing its
+// effect rather than its mechanism: a client that fails to fully read a
+// response body before returning forces net/http to close the connection
+// instead of reusing it, so a dropped drain shows up here as more than one
+// connection across repeated calls to the same server.
 func TestDoJSONNilOutDiscardsBody(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"name":"deploy plan"}`))
 	}))
+	var newConns atomic.Int32
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
 	defer srv.Close()
 
 	c := New(srv.URL, Tokens{Access: "acc-1"})
-	if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
-		t.Fatalf("doJSON returned %v", err)
+	for i := 0; i < 5; i++ {
+		if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
+			t.Fatalf("call %d: doJSON returned %v", i, err)
+		}
+	}
+
+	if got := newConns.Load(); got != 1 {
+		t.Errorf("new connections opened across 5 calls = %d, want 1 (an undrained body forces a fresh connection per call)", got)
 	}
 }
 
@@ -1353,18 +1381,245 @@ func TestDoJSONNoTokenOmitsAuthorizationHeader(t *testing.T) {
 		t.Fatalf("doJSON returned %v", err)
 	}
 }
+
+func TestDoJSONNormalizesMissingLeadingSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/thing" {
+			t.Errorf("path = %q, want /thing", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	if err := c.doJSON(context.Background(), http.MethodGet, "thing", nil, nil); err != nil {
+		t.Fatalf("doJSON returned %v", err)
+	}
+}
+
+func TestDoJSONFallsBackToDeprecatedErrorField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"legacy wording"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Message != "legacy wording" {
+		t.Errorf("Message = %q, want the deprecated error field's wording", apiErr.Message)
+	}
+}
+
+func TestDoJSONPrefersMessageOverDeprecatedErrorField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"dup","message":"real msg"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Message != "real msg" {
+		t.Errorf("Message = %q, want message to win over the deprecated error field", apiErr.Message)
+	}
+}
+
+func TestDoJSONSurfacesServerErrorCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"message":"free tier message limit reached","code":"QUOTA"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Code != "QUOTA" {
+		t.Errorf("Code = %q, want QUOTA", apiErr.Code)
+	}
+}
+
+// TestDoJSONDrainsOversizedErrorBody pins the drain of whatever is left after
+// decodeAPIError's 64KB-capped read, the same way TestDoJSONNilOutDiscardsBody
+// pins the out==nil drain: by observing connection reuse across repeated
+// calls rather than the drain call itself.
+func TestDoJSONDrainsOversizedErrorBody(t *testing.T) {
+	big := bytes.Repeat([]byte("x"), 128<<10) // well past the 64KB read cap
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write(big)
+	}))
+	var newConns atomic.Int32
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	for i := 0; i < 5; i++ {
+		err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("call %d: error = %v, want *APIError", i, err)
+		}
+	}
+
+	if got := newConns.Load(); got != 1 {
+		t.Errorf("new connections opened across 5 calls = %d, want 1 (the remainder past the 64KB cap must be drained)", got)
+	}
+}
+
+// TestDoJSONTreatsNotModifiedAsError pins the 2xx-only success boundary using
+// 304: net/http's client never auto-follows a 304 (it only follows
+// 301/302/303/307/308), so this is deterministic without needing to disable
+// redirect handling or supply a Location header.
+func TestDoJSONTreatsNotModifiedAsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Status != http.StatusNotModified {
+		t.Errorf("Status = %d, want 304", apiErr.Status)
+	}
+}
+
+func TestDoJSONContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	err := c.doJSON(ctx, http.MethodGet, "/thing", nil, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestDoJSONErrorEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.Status != http.StatusInternalServerError {
+		t.Errorf("Status = %d, want 500", apiErr.Status)
+	}
+	if apiErr.Message != "" {
+		t.Errorf("Message = %q, want empty for an empty body", apiErr.Message)
+	}
+}
+
+func TestDoJSONSuccessBodyNotJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html>Sign in to WiFi</html>"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	var out struct {
+		Name string `json:"name"`
+	}
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, &out)
+	if err == nil {
+		t.Fatal("doJSON returned nil error for a non-JSON 200 body")
+	}
+	if !strings.Contains(err.Error(), "Sign in to WiFi") {
+		t.Errorf("error = %q, want it to include the response snippet", err.Error())
+	}
+	if !strings.Contains(err.Error(), "not JSON") {
+		t.Errorf("error = %q, want a not-JSON hint", err.Error())
+	}
+}
+
+func TestDoJSONNonJSONErrorBodyIncludesSnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("<html>502 Bad Gateway nginx</html>"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "502 Bad Gateway nginx") {
+		t.Fatalf("error = %v, want it to include the response body snippet", err)
+	}
+}
+
+func TestDoJSONUnrecognizedJSONErrorBodyIncludesSnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"detail":"upstream refused"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1"})
+	err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "upstream refused") {
+		t.Fatalf("error = %v, want it to include the response body snippet", err)
+	}
+}
 ```
 
 The test file's import block is:
 
 ```go
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 ```
 
@@ -1397,19 +1652,33 @@ import (
 	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
 
+// maxErrorBodySnippet caps how much of a non-envelope response body ends up
+// in APIError.Snippet: enough to recognize a captive portal or proxy page,
+// short enough not to dump a full HTML document into a terminal.
+const maxErrorBodySnippet = 200
+
 // APIError is a non-2xx response. Message is the server's own wording, which
 // the CLI surfaces verbatim rather than inventing its own.
 type APIError struct {
 	Status  int
 	Code    string
 	Message string
+	// Snippet is a whitespace-collapsed, truncated view of the raw response
+	// body. It is populated only when neither Message nor the deprecated
+	// Error field yielded anything — e.g. a captive portal's HTML page, or a
+	// proxy's plain-text error — so a CLI user without a network tab still
+	// sees a clue about what actually came back instead of a bare status.
+	Snippet string
 }
 
 func (e *APIError) Error() string {
-	if e.Message == "" {
-		return fmt.Sprintf("server returned %d", e.Status)
+	if e.Message != "" {
+		return fmt.Sprintf("%s (HTTP %d)", e.Message, e.Status)
 	}
-	return fmt.Sprintf("%s (HTTP %d)", e.Message, e.Status)
+	if e.Snippet != "" {
+		return fmt.Sprintf("server returned %d: %s", e.Status, e.Snippet)
+	}
+	return fmt.Sprintf("server returned %d", e.Status)
 }
 
 // Tokens is a token pair held in memory by a Client.
@@ -1419,6 +1688,12 @@ type Tokens struct {
 }
 
 // Client talks to one WhatIff server.
+//
+// New is the intended constructor: it trims a trailing slash from BaseURL so
+// callers can pass either form, and sets a bounded HTTP client. Both fields
+// are exported, so a struct literal like &Client{BaseURL: x} compiles but
+// skips that normalization; doJSON falls back to http.DefaultClient rather
+// than panicking when HTTP is left nil that way.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
@@ -1435,8 +1710,14 @@ type Client struct {
 func New(baseURL string, t Tokens) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
-		tokens:  t,
+		// Timeout is a hard ceiling over the whole request — dial through
+		// body read — and it outranks whatever deadline a caller's ctx
+		// carries into doJSON; a longer per-call context does not extend it.
+		// That will matter once a call streams a large body (e.g. milestone
+		// 5's image downloads); HTTP is exported so a caller needing more
+		// time can replace it with its own *http.Client.
+		HTTP:   &http.Client{Timeout: 60 * time.Second},
+		tokens: t,
 	}
 }
 
@@ -1451,6 +1732,17 @@ func (c *Client) accessToken() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tokens.Access
+}
+
+// httpClient returns c.HTTP, falling back to http.DefaultClient for a Client
+// built as a struct literal rather than via New — otherwise c.HTTP.Do panics
+// on a nil receiver even though both fields it would take to construct one
+// that way are exported and look like a legitimate way to build a Client.
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
 }
 
 // doJSON performs one request with no refresh handling. Callers that need
@@ -1483,7 +1775,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
@@ -1496,15 +1788,43 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+
+	// Read the full body rather than streaming it straight into the decoder:
+	// json.Decoder.Decode can stop as soon as it has one complete value,
+	// leaving a non-JSON body only partially drained and forcing the
+	// transport to close the connection instead of reusing it. Reading first
+	// also lets a decode failure be diagnosed against the raw bytes — a
+	// captive portal's HTML page otherwise decodes as a bare JSON syntax
+	// error with no hint that HTML came back at all.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading %s %s response: %w", method, path, err)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		if !looksLikeJSON(raw) {
+			return fmt.Errorf("%s %s: response was not JSON: %s: %w", method, path, snippet(raw), err)
+		}
 		return fmt.Errorf("decoding %s %s response: %w", method, path, err)
 	}
 	return nil
 }
 
+// looksLikeJSON reports whether raw starts, after leading whitespace, with a
+// JSON object or array. It tells "the server sent JSON that doesn't match our
+// struct" apart from "the server didn't send JSON at all" (an HTML captive
+// portal page, a proxy's plain-text error) so doJSON's error can name which
+// one happened instead of surfacing a bare decode error either way.
+func looksLikeJSON(raw []byte) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		return false
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
 // decodeAPIError turns a non-2xx response into an *APIError. A body that is not
 // the server's JSON error envelope (a proxy's HTML 502, say) still yields a
-// useful error carrying the status.
+// useful error carrying the status and a snippet of what actually came back.
 func decodeAPIError(resp *http.Response) error {
 	apiErr := &APIError{Status: resp.StatusCode}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -1522,14 +1842,32 @@ func decodeAPIError(resp *http.Response) error {
 			apiErr.Message = envelope.Error
 		}
 	}
+	if apiErr.Message == "" {
+		apiErr.Snippet = snippet(raw)
+	}
 	return apiErr
+}
+
+// snippet collapses raw's whitespace into single spaces and truncates it to
+// maxErrorBodySnippet runes, so an HTML proxy page or plain-text error shows
+// up as a recognizable fragment in an error message instead of vanishing.
+func snippet(raw []byte) string {
+	s := strings.Join(strings.Fields(string(raw)), " ")
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) > maxErrorBodySnippet {
+		return string(r[:maxErrorBodySnippet]) + "…"
+	}
+	return s
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/cli/client/ -v`
-Expected: PASS, six tests.
+Expected: PASS, seventeen tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1569,6 +1907,43 @@ unreusable, not the request itself in error.
 until the server 404s in a confusing way. `doJSON` prepends `/` when `path`
 doesn't already start with one, so the concatenation is correct regardless of
 how a call site spells its path.
+
+#### Why non-envelope error and success bodies carry a snippet
+
+A code-review mutation-testing pass found the original test suite didn't pin
+several of the behaviors above — 6 of 8 injected mutations survived — and
+separately measured what a CLI user actually sees on three common failures:
+a captive portal or corporate proxy returning HTML on a 200, a proxy's HTML
+502, and a JSON error body that doesn't match `models.ErrorResponse`. In all
+three cases the user got either a bare `server returned 502` or a raw JSON
+syntax error with no indication that non-JSON (or unrecognized-shape JSON)
+came back at all. For a CLI with no network tab, that is the single most
+useful piece of information missing from the error path — and it is
+common, not exotic: any user behind a captive portal or corporate proxy hits
+it before they hit a real API error.
+
+`APIError` gains a fourth field, `Snippet`, populated only when neither
+`Message` nor the deprecated `Error` field yielded anything — so a caller
+that already has a real message never sees a change in behavior, and
+`Status`/`Code`/`Message` keep their existing meaning exactly. `Error()`
+falls back to including the snippet only when `Message` is empty. On the
+success path, `doJSON` now reads the full body with `io.ReadAll` before
+attempting `json.Unmarshal` rather than streaming into `json.NewDecoder`
+directly; this both lets a decode failure be diagnosed against the raw bytes
+(via `looksLikeJSON`, distinguishing "not JSON at all" from "JSON that
+doesn't match the struct") and fixes a real connection-reuse gap the same
+review measured: `json.Decoder.Decode` can return before reading the rest of
+a non-JSON body, leaving the connection undrained.
+
+#### Why `doJSON` falls back to `http.DefaultClient`
+
+`Client.BaseURL` and `Client.HTTP` are both exported, so `&Client{BaseURL:
+x}` compiles without going through `New` — and then panics the first time
+`doJSON` calls `c.HTTP.Do` on a nil `*http.Client`. `httpClient()` falls back
+to `http.DefaultClient` when `c.HTTP` is nil, so a struct literal degrades to
+an unbounded-timeout client rather than panicking; `Client`'s doc comment
+says `New` is the intended constructor precisely because a struct literal
+skips both this and the `BaseURL` trailing-slash normalization.
 
 ### Task 5: Login and refresh calls
 

@@ -19,19 +19,33 @@ import (
 	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
 
+// maxErrorBodySnippet caps how much of a non-envelope response body ends up
+// in APIError.Snippet: enough to recognize a captive portal or proxy page,
+// short enough not to dump a full HTML document into a terminal.
+const maxErrorBodySnippet = 200
+
 // APIError is a non-2xx response. Message is the server's own wording, which
 // the CLI surfaces verbatim rather than inventing its own.
 type APIError struct {
 	Status  int
 	Code    string
 	Message string
+	// Snippet is a whitespace-collapsed, truncated view of the raw response
+	// body. It is populated only when neither Message nor the deprecated
+	// Error field yielded anything — e.g. a captive portal's HTML page, or a
+	// proxy's plain-text error — so a CLI user without a network tab still
+	// sees a clue about what actually came back instead of a bare status.
+	Snippet string
 }
 
 func (e *APIError) Error() string {
-	if e.Message == "" {
-		return fmt.Sprintf("server returned %d", e.Status)
+	if e.Message != "" {
+		return fmt.Sprintf("%s (HTTP %d)", e.Message, e.Status)
 	}
-	return fmt.Sprintf("%s (HTTP %d)", e.Message, e.Status)
+	if e.Snippet != "" {
+		return fmt.Sprintf("server returned %d: %s", e.Status, e.Snippet)
+	}
+	return fmt.Sprintf("server returned %d", e.Status)
 }
 
 // Tokens is a token pair held in memory by a Client.
@@ -41,6 +55,12 @@ type Tokens struct {
 }
 
 // Client talks to one WhatIff server.
+//
+// New is the intended constructor: it trims a trailing slash from BaseURL so
+// callers can pass either form, and sets a bounded HTTP client. Both fields
+// are exported, so a struct literal like &Client{BaseURL: x} compiles but
+// skips that normalization; doJSON falls back to http.DefaultClient rather
+// than panicking when HTTP is left nil that way.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
@@ -57,8 +77,14 @@ type Client struct {
 func New(baseURL string, t Tokens) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
-		tokens:  t,
+		// Timeout is a hard ceiling over the whole request — dial through
+		// body read — and it outranks whatever deadline a caller's ctx
+		// carries into doJSON; a longer per-call context does not extend it.
+		// That will matter once a call streams a large body (e.g. milestone
+		// 5's image downloads); HTTP is exported so a caller needing more
+		// time can replace it with its own *http.Client.
+		HTTP:   &http.Client{Timeout: 60 * time.Second},
+		tokens: t,
 	}
 }
 
@@ -73,6 +99,17 @@ func (c *Client) accessToken() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tokens.Access
+}
+
+// httpClient returns c.HTTP, falling back to http.DefaultClient for a Client
+// built as a struct literal rather than via New — otherwise c.HTTP.Do panics
+// on a nil receiver even though both fields it would take to construct one
+// that way are exported and look like a legitimate way to build a Client.
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
 }
 
 // doJSON performs one request with no refresh handling. Callers that need
@@ -105,7 +142,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
@@ -118,15 +155,43 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+
+	// Read the full body rather than streaming it straight into the decoder:
+	// json.Decoder.Decode can stop as soon as it has one complete value,
+	// leaving a non-JSON body only partially drained and forcing the
+	// transport to close the connection instead of reusing it. Reading first
+	// also lets a decode failure be diagnosed against the raw bytes — a
+	// captive portal's HTML page otherwise decodes as a bare JSON syntax
+	// error with no hint that HTML came back at all.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading %s %s response: %w", method, path, err)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		if !looksLikeJSON(raw) {
+			return fmt.Errorf("%s %s: response was not JSON: %s: %w", method, path, snippet(raw), err)
+		}
 		return fmt.Errorf("decoding %s %s response: %w", method, path, err)
 	}
 	return nil
 }
 
+// looksLikeJSON reports whether raw starts, after leading whitespace, with a
+// JSON object or array. It tells "the server sent JSON that doesn't match our
+// struct" apart from "the server didn't send JSON at all" (an HTML captive
+// portal page, a proxy's plain-text error) so doJSON's error can name which
+// one happened instead of surfacing a bare decode error either way.
+func looksLikeJSON(raw []byte) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		return false
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
 // decodeAPIError turns a non-2xx response into an *APIError. A body that is not
 // the server's JSON error envelope (a proxy's HTML 502, say) still yields a
-// useful error carrying the status.
+// useful error carrying the status and a snippet of what actually came back.
 func decodeAPIError(resp *http.Response) error {
 	apiErr := &APIError{Status: resp.StatusCode}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -144,5 +209,23 @@ func decodeAPIError(resp *http.Response) error {
 			apiErr.Message = envelope.Error
 		}
 	}
+	if apiErr.Message == "" {
+		apiErr.Snippet = snippet(raw)
+	}
 	return apiErr
+}
+
+// snippet collapses raw's whitespace into single spaces and truncates it to
+// maxErrorBodySnippet runes, so an HTML proxy page or plain-text error shows
+// up as a recognizable fragment in an error message instead of vanishing.
+func snippet(raw []byte) string {
+	s := strings.Join(strings.Fields(string(raw)), " ")
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) > maxErrorBodySnippet {
+		return string(r[:maxErrorBodySnippet]) + "…"
+	}
+	return s
 }
