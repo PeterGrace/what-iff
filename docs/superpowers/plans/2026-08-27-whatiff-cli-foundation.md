@@ -864,12 +864,10 @@ NOTE: this uses `errors.Is`, not `err != ErrNoCredentials` — sentinel comparis
 by `!=` breaks the moment anyone wraps the error; `errors.Is` is the correct
 idiom and costs nothing.
 
-The six tests after `TestLoadMissingProfileReturnsErrNoCredentials` were added
-in a follow-up round after code review found two bugs empirically (see the
-Step 6 addendum below): a panic on a `null` file, and a corrupt file that
-locked `Save` out of recovering. They are shown here, in place, so this block
-stays in sync with the shipped test file rather than drifting into a stale
-historical snapshot.
+The six tests after `TestLoadMissingProfileReturnsErrNoCredentials` cover two
+bugs that code review found empirically — a panic on a `null` file, and a
+corrupt file that locked `Save` out of recovering. See "Why `readAll` normalizes
+and quarantines" after Step 5 for the reasoning.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1078,11 +1076,11 @@ git add internal/cli/config/credentials.go internal/cli/config/credentials_test.
 git commit -m "feat(cli): 0600 per-profile credential store with atomic writes"
 ```
 
-- [ ] **Step 6: Post-review hardening**
+#### Why `readAll` normalizes and quarantines
 
-A code review of the Step 5 commit empirically confirmed two bugs in
-`readAll`'s contract, both fixed above and covered by the tests added in
-Step 1:
+Not a step — the code in Step 3 already includes all of this. Recorded because
+both bugs were found empirically by code review, both are non-obvious, and both
+would be easy to reintroduce while "simplifying" `readAll`:
 
 - `json.Unmarshal([]byte("null"), &all)` sets `all` to `nil` with no error.
   `Save` then panicked on `all[profile] = c` — assignment to a nil map. Since
@@ -1103,14 +1101,6 @@ corrected comment on the temp file's `Chmod(0o600)` explaining it normalizes
 against the process umask rather than being redundant; and doc-comment notes
 on `Save` about its symlink-replacement behavior and about power-loss
 durability.
-
-Run: `go test ./internal/cli/config/ -v && go test ./internal/cli/config/ -race`
-Expected: PASS.
-
-```bash
-git add internal/cli/config/credentials.go internal/cli/config/credentials_test.go
-git commit -m "fix(cli): make credential store recoverable from a corrupt file"
-```
 
 ### Task 4: Base HTTP client and typed errors
 
