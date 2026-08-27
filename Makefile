@@ -50,7 +50,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: pre-commit
-pre-commit: fmt vet tidy test build check-no-local-models check-compose-defaults check-public-hygiene ## Run all pre-commit checks (matches CI/CD)
+pre-commit: fmt vet tidy test build build-cli-crosscheck check-no-local-models check-compose-defaults check-public-hygiene ## Run all pre-commit checks (matches CI/CD)
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: fmt
@@ -109,6 +109,14 @@ build: $(ENT_SENTINEL) ## Verify build works
 		cmd/api-server/main.go
 	@rm -f bootstrap
 	@echo "✅ Build successful"
+
+.PHONY: build-cli-crosscheck
+build-cli-crosscheck: ## Cross-compile the wi CLI for linux/darwin (build only, catches platform-specific build-tag mistakes like a file name that silently narrows its own //go:build line)
+	@echo "Cross-compiling cmd/whatiff-cli for linux/amd64, darwin/amd64, darwin/arm64..."
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@echo "✅ wi cross-compiles for linux/darwin"
 
 .PHONY: install-hooks
 install-hooks: ## Install git pre-commit hook

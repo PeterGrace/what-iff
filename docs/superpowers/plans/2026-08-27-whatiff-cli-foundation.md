@@ -4056,6 +4056,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
 )
 
@@ -4141,6 +4142,56 @@ api_url = "https://staging.example.com/api"
 		t.Errorf("error %q does not list the available profile %q", msg, "staging")
 	}
 }
+
+// TestNewSession_OnRefreshPreservesUsername is the regression test for a
+// specific way newSession's OnRefresh closure could quietly break: an
+// implementation that builds its config.Credentials from only the new token
+// pair (e.g. config.Credentials{AccessToken: t.Access, RefreshToken:
+// t.Refresh}) would silently blank the stored username on every token
+// refresh. Nothing else would notice - Username is written once at login
+// and never otherwise read back by any code path a human would look at
+// during normal use - so this has to be checked directly rather than
+// trusted to show up as a side effect of something else failing.
+func TestNewSession_OnRefreshPreservesUsername(t *testing.T) {
+	writeConfig(t, `
+[profiles.local]
+api_url = "http://127.0.0.1:1"
+`)
+	store, err := config.DefaultCredentialStore()
+	if err != nil {
+		t.Fatalf("DefaultCredentialStore: %v", err)
+	}
+	if err := store.Save("local", config.Credentials{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		Username:     "tester",
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	sess, err := newSession("local")
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	// Invoke the closure directly with a fresh token pair, the same way
+	// client.refreshTokens would call it after a real refresh - no network
+	// round trip needed, since OnRefresh is just persisting to disk.
+	if err := sess.client.OnRefresh(client.Tokens{Access: "new-access", Refresh: "new-refresh"}); err != nil {
+		t.Fatalf("OnRefresh: %v", err)
+	}
+
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatalf("Load after refresh: %v", err)
+	}
+	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" {
+		t.Errorf("tokens after refresh = %+v, want access=new-access refresh=new-refresh", got)
+	}
+	if got.Username != "tester" {
+		t.Errorf("Username after refresh = %q, want %q (must survive every refresh)", got.Username, "tester")
+	}
+}
 ```
 
 - [ ] **Step 3: Run the tests and verify the binary compiles**
@@ -4154,9 +4205,12 @@ and 10 supply them. Do not commit yet.
 
 **Files:**
 - Create: `cmd/whatiff-cli/login.go`
-- Create: `cmd/whatiff-cli/tty_unix.go`
+- Create: `cmd/whatiff-cli/tty_tcflsh.go`
+- Create: `cmd/whatiff-cli/tty_bsd.go`
 - Create: `cmd/whatiff-cli/tty_other.go`
 - Test: `cmd/whatiff-cli/login_test.go`
+- Test: `cmd/whatiff-cli/main_test.go` (adds `TestNewSession_OnRefreshPreservesUsername`)
+- Modify: `Makefile` (adds `build-cli-crosscheck`, wired into `pre-commit`)
 
 #### Why `promptLine` takes one shared `*bufio.Reader` instead of building its own
 
@@ -4201,37 +4255,107 @@ instant it arrives, because local echo is still on; it is only turned off once
 `term.ReadPassword` runs, by which point the password has already been echoed
 and is sitting in scrollback.
 
-`flushPendingInput` (`tty_unix.go`) is the fix, and it is the same trick
-`sudo` uses immediately before its own password prompt: `promptPassword`
-calls it right before turning off echo, discarding whatever the tty driver
-has queued via `TCFLSH`/`TCIFLUSH` so the stale line can never be silently
-read back as the password once echo is off. **It cannot undo the echo that
-already happened.** The paste is already on screen and in scrollback; the
-flush only prevents it from being *used*. `promptPassword` is honest about
-this distinction: when `flushPendingInput` reports something was actually
-discarded, it prints `warning: discarded pending input before the password
-prompt - if you pasted your password it may be visible in your terminal
-history` to stderr. An ordinary typed login — nothing queued when the flush
-runs — stays silent; the warning is not printed "just in case."
+`flushPendingInput` is the fix, and it is the same trick `sudo` uses
+immediately before its own password prompt: `promptPassword` calls it right
+before turning off echo, discarding whatever the tty driver has queued so
+the stale line can never be silently read back as the password once echo is
+off. **It cannot undo the echo that already happened.** The paste is already
+on screen and in scrollback; the flush only prevents it from being *used*.
+`promptPassword` is honest about this distinction: when `flushPendingInput`
+reports something was actually discarded, it prints `warning: discarded
+pending input before the password prompt - if you pasted your password it
+may be visible in your terminal history` to stderr. An ordinary typed login
+— nothing queued when the flush runs — stays silent; the warning is not
+printed "just in case."
 
 `flushPendingInput` needs `unix.Poll` (not a `FIONREAD` ioctl) to check
 whether anything was pending *before* discarding it: `golang.org/x/sys/unix`
 does not export a `FIONREAD` constant in this module's pinned version (or, it
 turns out, any version), so a zero-timeout `POLLIN` poll answers the same
 yes/no question `flushPendingInput`'s caller needs, without reading (and thus
-itself consuming) the queued bytes. The function is split across two
-build-tagged files so the package still builds on non-unix platforms: the
-`unix` tag (Go's recognized shorthand for the whole `aix`/`darwin`/
-`dragonfly`/`freebsd`/`hurd`/`illumos`/`ios`/`linux`/`netbsd`/`openbsd`/
-`solaris` family) gets the real ioctl-based implementation; everything else
-gets a no-op that always reports nothing was discarded — honest, since on
-those platforms nothing was.
+itself consuming) the queued bytes.
 
 This is the one place `go.mod` changes in this task: `golang.org/x/sys` was
 already present as an *indirect* dependency (pulled in transitively); using
 `golang.org/x/sys/unix` directly promotes it to a direct one. `go mod tidy`
 picks up exactly that move — no version change, no new module, `go.sum`
 untouched — and `make tidy` must still pass.
+
+#### Why the flush ioctl is split three ways, one per platform family — and how that was verified
+
+An initial version of `flushPendingInput` lived in a single
+`//go:build unix` file using `TCFLSH`/`TCIFLUSH`. `unix` is Go's recognized
+shorthand for `aix`, `android`, `darwin`, `dragonfly`, `freebsd`, `hurd`,
+`illumos`, `ios`, `linux`, `netbsd`, `openbsd`, and `solaris` together — but
+`golang.org/x/sys/unix` does not export `TCFLSH` for most of that list. That
+broke the build on every BSD (`darwin`, `dragonfly`, `freebsd`, `netbsd`,
+`openbsd`) with `undefined: unix.TCFLSH`, caught by nothing in the pipeline:
+CI is Linux-only and the Makefile's own `build` target cross-compiles
+`GOOS=linux GOARCH=amd64` exclusively.
+
+The real per-`GOOS` split was determined by grepping every
+`zerrors_<goos>_<goarch>.go` file this module ships and then, critically,
+confirmed (and in two places, corrected) by cross-compiling for every `GOOS`
+Go itself supports rather than trusting either the grep or a header
+reference:
+
+- **`TCFLSH`/`TCIFLUSH`** (via `unix.IoctlSetInt`) is exported for `linux`
+  (every arch), `aix`, and `solaris`. This lives in **`tty_tcflsh.go`**.
+- **`TIOCFLUSH`** (value `0x80047410` on every one of them) is exported for
+  `darwin`, `dragonfly`, `freebsd`, `netbsd`, and `openbsd`. Unlike `TCFLSH`,
+  its ioctl argument is a pointer to an int bitmask selecting which queue to
+  flush, so it needs `unix.IoctlSetPointerInt`, not `IoctlSetInt`. The
+  bitmask value for "input queue" (`FREAD`, historically `0x1` on every
+  BSD-derived system) is not exported by `golang.org/x/sys/unix` on any of
+  these platforms either, so it is a literal with a comment explaining what
+  it means, not a symbolic constant. This lives in **`tty_bsd.go`**.
+- Everything else falls to the no-op in **`tty_other.go`**.
+
+Two mistakes surfaced only by cross-compiling, not by reading files:
+
+1. The first attempt named the `TCFLSH` file `tty_linux.go`, tagged
+   `//go:build linux || aix || solaris`. Cross-compiling for `aix` and
+   `solaris` still failed with `undefined: flushPendingInput` — a source
+   file named `..._<goos>.go` carries an *implicit* build constraint for
+   that `GOOS`, ANDed together with whatever the explicit `//go:build` line
+   says, so `tty_linux.go` only ever built for `linux` regardless of what
+   its tag claimed. Renaming the file to `tty_tcflsh.go` (a name Go's
+   filename matcher does not recognize as any `GOOS`) fixed it; `tty_bsd.go`
+   and `tty_other.go` were never affected, since "bsd" and "other" are not
+   `GOOS` names either.
+2. `illumos` was assumed to have neither constant, since grepping for an
+   `illumos`-named file in `golang.org/x/sys/unix` finds nothing. Once (1)
+   was fixed, cross-compiling for `illumos` still failed — until
+   `go help buildconstraint` revealed that `GOOS=illumos` matches every
+   `solaris`-tagged file *in addition to* its own (the same relationship
+   `android` has to `linux`, and `ios` has to `darwin`). `tty_tcflsh.go`'s
+   `linux || aix || solaris` tag already covers `illumos` as a result — no
+   file needed to name it explicitly, and no fourth file was needed.
+
+The three files' tags are each other's exact negation (`tty_other.go`'s is
+the explicit negation of the other two, spelled out term by term rather than
+as `!(A || B)`, to keep it grep-able), so every buildable `GOOS` matches
+exactly one: matching zero fails with `undefined: flushPendingInput`;
+matching two fails with a duplicate declaration. `hurd` — part of the `unix`
+tag, but with no zerrors file for either constant and no documented alias to
+another `GOOS` — falls to `tty_other.go`'s no-op; it is also not a target
+this Go toolchain can cross-compile for at all
+(`GOOS=hurd go build` reports "unsupported GOOS/GOARCH pair"), so this could
+not be verified by building even if desired.
+
+Nothing catches a platform-specific build mistake like this without an
+explicit check: `make build-cli-crosscheck` (wired into `pre-commit`)
+cross-compiles `cmd/whatiff-cli` for `linux/amd64`, `darwin/amd64`, and
+`darwin/arm64` — build only, no tests, fast — specifically so a Linux-only
+CI run and a Linux-only local `make build` can no longer both stay green
+while a Mac (or BSD) user's build is broken.
+
+`TestNewSession_OnRefreshPreservesUsername` (`main_test.go`, Task 8) is
+unrelated to the platform split but landed in the same pass: it is the
+direct regression test for `newSession`'s `OnRefresh` closure silently
+dropping the stored `Username` on every token refresh — invoking the closure
+directly with a fresh token pair and asserting the username survives,
+without needing a real HTTP round trip.
 
 #### Why `runLogin`'s empty-username guard is its own function
 
@@ -4375,10 +4499,14 @@ func promptPassword(prompt string) (string, error) {
 	// username prompt above has consumed its own line - and that queued line
 	// gets echoed to the screen the instant it arrives, before this function
 	// ever runs, because echo is still on until term.ReadPassword below
-	// turns it off. See flushPendingInput's doc comment (tty_unix.go) for
-	// why this is the same defense sudo uses. The flush error is ignored
+	// turns it off. See flushPendingInput's doc comment (tty_tcflsh.go, with
+	// tty_bsd.go and tty_other.go covering the rest of the build matrix) for
+	// why this is the same defense sudo uses. The error return is ignored
 	// deliberately: it is best-effort hardening, not a prerequisite for
-	// reading a password, so a failing ioctl must not fail the whole login.
+	// reading a password, so a failing ioctl must not fail the whole login -
+	// but discarded itself is still trustworthy even when flushPendingInput
+	// also returned an error, since it reflects only what Poll observed, not
+	// whether the flush that followed succeeded.
 	discarded, _ := flushPendingInput(fd)
 	if discarded {
 		// This cannot undo the echo that already happened - only prevent the
@@ -4399,7 +4527,7 @@ func promptPassword(prompt string) (string, error) {
 ```
 
 ```go
-//go:build unix
+//go:build linux || aix || solaris
 
 package main
 
@@ -4424,6 +4552,35 @@ import "golang.org/x/sys/unix"
 // responsible for warning about that separately, using this function's
 // reported bool to know whether there was anything to warn about.
 //
+// This file is one of three platform-specific implementations, split by
+// which ioctl request constant golang.org/x/sys/unix actually exports for
+// the target GOOS - verified by cross-compiling for every GOOS Go supports,
+// not by trusting a header reference or a filename grep (both misled an
+// earlier version of this split - see the note on the file name below and
+// the illumos note further down). TCFLSH is exported for linux (every arch
+// this repo might target), aix, and solaris. tty_bsd.go covers the
+// platforms where x/sys/unix instead exports TIOCFLUSH; tty_other.go is the
+// no-op fallback for every remaining GOOS.
+//
+// This file is deliberately NOT named tty_linux.go. A source file whose name
+// ends in "_<goos>.go" gets an implicit build constraint for that GOOS,
+// ANDed together with whatever an explicit "//go:build" line says - so
+// tty_linux.go with a "//go:build linux || aix || solaris" line would still
+// only ever build for linux, silently excluding aix and solaris despite the
+// tag naming them (confirmed by cross-compiling: both failed with
+// "undefined: flushPendingInput" until this file was renamed). tty_bsd.go
+// and tty_other.go are unaffected only because "bsd" and "other" are not
+// recognized GOOS names Go's file-name matching looks for.
+//
+// illumos is covered by this file too, via its "linux || aix || solaris"
+// tag, even though no zerrors_illumos_*.go file exists anywhere in this
+// module: `go help buildconstraint` documents that GOOS=illumos matches
+// every "solaris"-tagged file in addition to its own, and cross-compiling
+// confirms unix.TCFLSH really does resolve for GOOS=illumos as a result. A
+// filename-only search for "illumos" (which is how the platform set here
+// was first drafted) misses this and wrongly concludes illumos has no
+// working ioctl constant at all.
+//
 // Whether anything was pending is checked with a zero-timeout unix.Poll
 // (POLLIN) immediately before the flush, not by reading: a read would
 // consume bytes itself rather than leaving the flush to do it, and this
@@ -4431,34 +4588,105 @@ import "golang.org/x/sys/unix"
 // golang.org/x/sys/unix to ask the kernel "how many bytes" directly across
 // every GOOS this build tag covers. Poll only answers yes/no, which is all
 // the caller needs to decide whether to print a warning.
+//
+// The poll result and the flush are independent facts, and both are
+// attempted unconditionally: an earlier version returned early on a Poll
+// error (so a stray EINTR would skip the flush entirely, leaving a stale
+// password line in place) and discarded a true "pending" the moment the
+// ioctl itself failed (so "something was pending but the flush failed" was
+// indistinguishable from "nothing was pending" - silently accepting the
+// stale pasted line as the password with no warning at all, the exact
+// failure this function exists to prevent). pending now reflects only what
+// Poll observed, err reports whichever step failed (flush takes priority,
+// since a caller that only checks err for logging purposes should see the
+// more actionable failure), and the flush always runs regardless of whether
+// Poll succeeded.
 func flushPendingInput(fd int) (bool, error) {
 	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	n, err := unix.Poll(fds, 0)
-	if err != nil {
-		return false, err
-	}
-	pending := n > 0 && fds[0].Revents&unix.POLLIN != 0
+	n, pollErr := unix.Poll(fds, 0)
+	pending := pollErr == nil && n > 0 && fds[0].Revents&unix.POLLIN != 0
 
-	if err := unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH); err != nil {
-		return false, err
+	flushErr := unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+
+	err := flushErr
+	if err == nil {
+		err = pollErr
 	}
-	return pending, nil
+	return pending, err
 }
 ```
-
 ```go
-//go:build !unix
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 
 package main
 
-// flushPendingInput is a no-op on non-unix platforms (Windows): there is no
-// TCFLSH-equivalent wired up here, so a paste landing on the terminal
-// immediately before the password prompt is not defended against on those
-// platforms. Rather than pretending otherwise, this always reports that
-// nothing was discarded - which is honest, since flushPendingInput's only
-// caller (promptPassword) uses the returned bool solely to decide whether to
-// print a warning about discarded input, and printing that warning here
-// would be a lie.
+import "golang.org/x/sys/unix"
+
+// flushBSDInputQueue selects TIOCFLUSH's input-queue argument: the BSD
+// family's TIOCFLUSH ioctl takes a pointer to an int bitmask naming which
+// queue(s) to flush (0 means both), built from the historic BSD
+// sys/fcntl.h FREAD/FWRITE bits. golang.org/x/sys/unix does not export
+// either constant on darwin/dragonfly/freebsd/netbsd/openbsd (checked by
+// grepping the whole module, not just this platform's generated file), so
+// the literal is spelled out here instead of a symbolic name that does not
+// exist. FREAD is 0x1 on every BSD-derived system, a value that predates
+// and is far more stable than anything this file needs to track.
+const flushBSDInputQueue = 0x1
+
+// flushPendingInput discards any input already queued by the terminal
+// driver for fd, and reports whether it actually discarded something.
+//
+// See tty_tcflsh.go's doc comment for the full rationale (the sudo-style
+// paste defense, and why both the poll result and the flush attempt are
+// unconditional and independent). This file exists because
+// golang.org/x/sys/unix does not export TCFLSH for darwin, dragonfly,
+// freebsd, netbsd, or openbsd - confirmed by grepping the module's
+// generated zerrors_<goos>_<goarch>.go files for every arch this repo might
+// target, and by cross-compiling for each GOOS, not by trusting a header
+// reference. These platforms instead export TIOCFLUSH (value 0x80047410 on
+// every one of them in this module), which - unlike TCFLSH's IoctlSetInt -
+// takes its argument by pointer: IoctlSetPointerInt, not IoctlSetInt.
+func flushPendingInput(fd int) (bool, error) {
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, pollErr := unix.Poll(fds, 0)
+	pending := pollErr == nil && n > 0 && fds[0].Revents&unix.POLLIN != 0
+
+	flushErr := unix.IoctlSetPointerInt(fd, unix.TIOCFLUSH, flushBSDInputQueue)
+
+	err := flushErr
+	if err == nil {
+		err = pollErr
+	}
+	return pending, err
+}
+```
+```go
+//go:build !linux && !aix && !solaris && !darwin && !dragonfly && !freebsd && !netbsd && !openbsd
+
+package main
+
+// flushPendingInput is a no-op on every GOOS not covered by tty_tcflsh.go or
+// tty_bsd.go - Windows, Plan 9, js/wasm, and GNU/Hurd (which, unlike
+// illumos, is not documented anywhere as inheriting another GOOS's build
+// tags, has no zerrors_hurd_*.go file in golang.org/x/sys/unix defining
+// either TCFLSH or TIOCFLUSH, and is not even a target this Go toolchain
+// can cross-compile for - `GOOS=hurd go build` reports "unsupported
+// GOOS/GOARCH pair" outright). Rather than pretending otherwise, this
+// always reports that nothing was discarded - which is honest, since
+// flushPendingInput's only caller (promptPassword) uses the returned bool
+// solely to decide whether to print a warning about discarded input, and
+// printing that warning here would be a lie.
+//
+// illumos is NOT handled here despite not having its own zerrors file in
+// x/sys/unix: `go help buildconstraint` documents that GOOS=illumos matches
+// every "solaris"-tagged file too, so tty_tcflsh.go's "linux || aix ||
+// solaris" tag already covers it (confirmed by cross-compiling for
+// GOOS=illumos) - see that file's doc comment for the full explanation.
+//
+// The three tty_*.go files' build tags are each other's exact negation, so
+// every GOOS matches exactly one of them: a GOOS matching zero would fail to
+// build (undefined: flushPendingInput), and one matching two would fail to
+// build the other way (duplicate declaration).
 func flushPendingInput(fd int) (bool, error) {
 	return false, nil
 }
@@ -4578,6 +4806,53 @@ direct `require` block; no version changes; `go.sum` is unchanged. Then run
 `make tidy` (after `git add go.mod`, since the check compares against the
 last commit) and confirm it passes.
 
+- [ ] **Step 5: Add the cross-compile check and prove it catches the platform bug**
+
+Add `build-cli-crosscheck` to the `Makefile` (near the existing `build`
+target) and wire it into `pre-commit`:
+
+```makefile
+.PHONY: build-cli-crosscheck
+build-cli-crosscheck: ## Cross-compile the wi CLI for linux/darwin (build only, catches platform-specific build-tag mistakes like a file name that silently narrows its own //go:build line)
+	@echo "Cross-compiling cmd/whatiff-cli for linux/amd64, darwin/amd64, darwin/arm64..."
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@echo "✅ wi cross-compiles for linux/darwin"
+```
+
+Add `build-cli-crosscheck` to `pre-commit`'s prerequisite list, right after
+`build`. It intentionally has no `$(ENT_SENTINEL)` prerequisite —
+`cmd/whatiff-cli` does not import `ent` (`go list -deps` confirms zero
+`.../ent` packages in its dependency graph) — and intentionally builds to
+`/dev/null` rather than a real output path, so it stays fast (a few seconds)
+and leaves nothing to clean up.
+
+Run: `make build-cli-crosscheck`
+Expected: `✅ wi cross-compiles for linux/darwin`.
+
+Then verify it actually would have caught the original bug: temporarily
+replace `tty_tcflsh.go`, `tty_bsd.go`, and `tty_other.go` with a single
+`//go:build unix` file using `unix.TCFLSH` (the broken shape this task
+started from), run `make build-cli-crosscheck` again, and confirm it fails
+with `undefined: unix.TCFLSH`. Restore the three files afterward and confirm
+`git diff` (or a byte-for-byte `diff` against a backup) shows no change.
+
+Finally, cross-compile for the full platform matrix directly (not just the
+two `build-cli-crosscheck` covers) to confirm the split is complete:
+
+```bash
+for os in linux darwin freebsd openbsd netbsd dragonfly solaris illumos aix windows plan9; do
+  GOOS=$os go build -o /dev/null ./cmd/whatiff-cli 2>&1 | head -3
+done
+GOOS=js GOARCH=wasm go build -o /dev/null ./cmd/whatiff-cli
+```
+
+`darwin`/`freebsd`/`openbsd`/`netbsd`/`dragonfly` need no `GOARCH` override
+on an amd64 host; `aix` needs `GOARCH=ppc64` (its only supported arch) and
+`solaris`/`illumos` need `GOARCH=amd64` explicitly, or `go build` reports an
+unsupported pair. Expected: every one builds with no output.
+
 ### Task 10: `wi chats`
 
 **Files:**
@@ -4586,7 +4861,7 @@ last commit) and confirm it passes.
 
 #### Why `runChats` prints a truncation notice to stderr, and `--json` emits the whole `ChatPage`
 
-`ListChats` returns `ChatPage{{Results, TotalCount}}` specifically so a capped
+`ListChats` returns `ChatPage{Results, TotalCount}` specifically so a capped
 listing can be told apart from an account that only has that many chats (see
 `ChatPage`'s doc comment in `internal/cli/client/chat.go`) — but a command
 that decodes `page.Results` and prints only that throws the one piece of
@@ -4615,7 +4890,7 @@ server can send `"results"` as `null`, or omit the key entirely — either one
 decodes into a nil `Results` (see `internal/cli/client/chat_test.go`'s
 `TestListChatsMissingResultsField`/`TestListChatsNullResultsField`) — so
 without normalization, `wi chats --json` on an empty account emits
-`{{"results":null,...}}`. A script doing `jq '.results[]'` or a naive
+`{"results":null,...}`. A script doing `jq '.results[]'` or a naive
 for-range loop over the decoded field breaks on `null` in a way it would not
 on `[]`, for a value that means exactly the same thing either way: no chats.
 `normalizeResultsForJSON` is a separate pure function (rather than an inline
@@ -4954,7 +5229,12 @@ Run: `go test ./cmd/whatiff-cli/ ./internal/cli/... -race && go vet ./cmd/whatif
 Expected: all tests pass, `go vet` and `go build` produce no output. The
 binary now compiles end to end.
 
-- [ ] **Step 4: Manually verify the binary's behavior**
+- [ ] **Step 4: Verify the cross-compile matrix, then manually verify the binary's behavior**
+
+Run `make build-cli-crosscheck` (see Task 9 step 5) once more here, now that
+`chats.go` completes the build — this is the point at which the whole
+binary, not just the platform-specific tty files in isolation, has to
+cross-compile clean.
 
 Exit codes, stdout/stderr routing, and the not-logged-in / unknown-profile /
 non-TTY-password / pasted-password error paths only show up by actually
@@ -5006,13 +5286,16 @@ appear — a normal login must stay silent.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add cmd/whatiff-cli/ .gitignore go.mod
-git commit -m "fix(cli): stop a pasted password reaching the terminal"
+git add cmd/whatiff-cli/ .gitignore go.mod Makefile
+git commit -m "fix(cli): use the right terminal flush ioctl per platform"
 ```
 
 `go.mod` is included deliberately and only for the `golang.org/x/sys`
 indirect-to-direct promotion described in Task 9 — `go.sum`, `go work`, and
-`ent/` are never part of this commit.
+`ent/` are never part of this commit. `Makefile` is included for
+`build-cli-crosscheck` (Task 9 step 5), the check that exists specifically
+because nothing else in the pipeline would have caught the platform split
+being wrong.
 
 ### Task 11: Makefile targets, package docs, and an end-to-end check
 

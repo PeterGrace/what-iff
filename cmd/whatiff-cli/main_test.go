@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
 )
 
@@ -89,5 +90,55 @@ api_url = "https://staging.example.com/api"
 	}
 	if !strings.Contains(msg, "staging") {
 		t.Errorf("error %q does not list the available profile %q", msg, "staging")
+	}
+}
+
+// TestNewSession_OnRefreshPreservesUsername is the regression test for a
+// specific way newSession's OnRefresh closure could quietly break: an
+// implementation that builds its config.Credentials from only the new token
+// pair (e.g. config.Credentials{AccessToken: t.Access, RefreshToken:
+// t.Refresh}) would silently blank the stored username on every token
+// refresh. Nothing else would notice - Username is written once at login
+// and never otherwise read back by any code path a human would look at
+// during normal use - so this has to be checked directly rather than
+// trusted to show up as a side effect of something else failing.
+func TestNewSession_OnRefreshPreservesUsername(t *testing.T) {
+	writeConfig(t, `
+[profiles.local]
+api_url = "http://127.0.0.1:1"
+`)
+	store, err := config.DefaultCredentialStore()
+	if err != nil {
+		t.Fatalf("DefaultCredentialStore: %v", err)
+	}
+	if err := store.Save("local", config.Credentials{
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		Username:     "tester",
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	sess, err := newSession("local")
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	// Invoke the closure directly with a fresh token pair, the same way
+	// client.refreshTokens would call it after a real refresh - no network
+	// round trip needed, since OnRefresh is just persisting to disk.
+	if err := sess.client.OnRefresh(client.Tokens{Access: "new-access", Refresh: "new-refresh"}); err != nil {
+		t.Fatalf("OnRefresh: %v", err)
+	}
+
+	got, err := store.Load("local")
+	if err != nil {
+		t.Fatalf("Load after refresh: %v", err)
+	}
+	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" {
+		t.Errorf("tokens after refresh = %+v, want access=new-access refresh=new-refresh", got)
+	}
+	if got.Username != "tester" {
+		t.Errorf("Username after refresh = %q, want %q (must survive every refresh)", got.Username, "tester")
 	}
 }

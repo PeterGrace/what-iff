@@ -121,10 +121,14 @@ func promptPassword(prompt string) (string, error) {
 	// username prompt above has consumed its own line - and that queued line
 	// gets echoed to the screen the instant it arrives, before this function
 	// ever runs, because echo is still on until term.ReadPassword below
-	// turns it off. See flushPendingInput's doc comment (tty_unix.go) for
-	// why this is the same defense sudo uses. The flush error is ignored
+	// turns it off. See flushPendingInput's doc comment (tty_tcflsh.go, with
+	// tty_bsd.go and tty_other.go covering the rest of the build matrix) for
+	// why this is the same defense sudo uses. The error return is ignored
 	// deliberately: it is best-effort hardening, not a prerequisite for
-	// reading a password, so a failing ioctl must not fail the whole login.
+	// reading a password, so a failing ioctl must not fail the whole login -
+	// but discarded itself is still trustworthy even when flushPendingInput
+	// also returned an error, since it reflects only what Poll observed, not
+	// whether the flush that followed succeeded.
 	discarded, _ := flushPendingInput(fd)
 	if discarded {
 		// This cannot undo the echo that already happened - only prevent the
