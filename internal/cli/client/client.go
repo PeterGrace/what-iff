@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,7 +124,8 @@ func (c *Client) httpClient() *http.Client {
 }
 
 // doJSON performs one request with no refresh handling. Callers that need
-// transparent re-auth use do (added in the next task).
+// transparent re-auth use do, below — Login and refreshTokens are the only
+// exceptions, since neither has a token worth retrying yet.
 //
 // doJSON JSON-unmarshals the entire response body, so it cannot be used for a
 // large binary payload such as milestone 5's image downloads — those need a
@@ -263,4 +265,53 @@ func snippet(raw []byte) string {
 		return string(r[:maxErrorBodySnippet]) + "…"
 	}
 	return s
+}
+
+// do performs a request, refreshing the access token once and retrying if the
+// server rejects it. Every caller outside this file uses do, not doJSON, so a
+// two-hour access token expiring mid-session is invisible to the user.
+//
+// stale is read before doJSON, which re-reads the token itself under the
+// mutex; a concurrent refresh landing in the gap between the two reads means
+// stale may not be the token actually sent on the wire. That's a benign
+// race, deliberately left alone: worst case is one extra 401 round trip, and
+// fixing it would mean threading an explicit token through doJSON — breaking
+// its signature and its 24 existing tests — for no user-visible gain.
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	stale := c.accessToken()
+	err := c.doJSON(ctx, method, path, body, out)
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+		return err
+	}
+	// No token was sent at all, so a fresh one wouldn't change anything —
+	// refreshing here would just be an extra round trip against
+	// /user/refresh with a refresh token that has nothing to do with this
+	// 401 (an unauthenticated endpoint, a client with no session yet).
+	if stale == "" {
+		return err
+	}
+
+	refreshed, refreshErr := c.refreshTokens(ctx, stale)
+	if !refreshed {
+		// The exchange itself failed (or the caller's context was canceled
+		// while waiting on another goroutine's exchange) — no new token
+		// exists to retry with, so the original 401 is the right error to
+		// surface.
+		return err
+	}
+	// The exchange succeeded — the client now holds a usable access token in
+	// memory — even if refreshErr is non-nil, which can only mean the
+	// *persist* step (OnRefresh) failed. A failed write to the credentials
+	// file must not fail this request: the retry below can still succeed,
+	// and will keep succeeding for the rest of the process's in-memory
+	// session even though the on-disk copy is stale. There is no logger
+	// wired into this package yet (nothing else in internal/cli logs either)
+	// and no other channel back to the caller that wouldn't also fail the
+	// request, so refreshErr is deliberately dropped here rather than
+	// invented a reporting path for; the alternative — failing the request —
+	// is exactly the regression this function exists to avoid.
+	_ = refreshErr
+	return c.doJSON(ctx, method, path, body, out)
 }

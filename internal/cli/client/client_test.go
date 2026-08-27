@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -577,5 +578,235 @@ func TestClientWithoutNewFallsBackToDefaultHTTPClient(t *testing.T) {
 	c := &Client{BaseURL: srv.URL}
 	if err := c.doJSON(context.Background(), http.MethodGet, "/thing", nil, nil); err != nil {
 		t.Fatalf("doJSON returned %v, want a struct-literal Client to work without New", err)
+	}
+}
+
+func TestDoRetriesOnceAfter401(t *testing.T) {
+	var thingCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			atomic.AddInt32(&thingCalls, 1)
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"name":"ok"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	var out struct {
+		Name string `json:"name"`
+	}
+	if err := c.do(context.Background(), http.MethodGet, "/thing", nil, &out); err != nil {
+		t.Fatalf("do returned %v", err)
+	}
+	if out.Name != "ok" {
+		t.Errorf("Name = %q, want ok", out.Name)
+	}
+	if got := atomic.LoadInt32(&thingCalls); got != 2 {
+		t.Errorf("/thing called %d times, want 2 (one 401, one retry)", got)
+	}
+}
+
+func TestDoDoesNotRetryTwice(t *testing.T) {
+	var thingCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user/refresh" {
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+			return
+		}
+		atomic.AddInt32(&thingCalls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	err := c.do(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil {
+		t.Fatal("do returned nil error on a persistent 401, want error")
+	}
+	if got := atomic.LoadInt32(&thingCalls); got != 2 {
+		t.Errorf("/thing called %d times, want 2 — one retry only, no loop", got)
+	}
+}
+
+// TestDoSucceedsWhenPersistFails is the full-path regression test for design
+// correction 1: OnRefresh fails to persist the refreshed tokens, but the
+// exchange itself succeeded, so the retried request must still succeed
+// rather than surfacing the original 401.
+func TestDoSucceedsWhenPersistFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"name":"ok"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	c.OnRefresh = func(Tokens) error {
+		return errors.New("read-only credentials file")
+	}
+
+	var out struct {
+		Name string `json:"name"`
+	}
+	if err := c.do(context.Background(), http.MethodGet, "/thing", nil, &out); err != nil {
+		t.Fatalf("do returned %v, want success despite the persist failure", err)
+	}
+	if out.Name != "ok" {
+		t.Errorf("Name = %q, want ok", out.Name)
+	}
+}
+
+// TestRefreshExpiredRefreshTokenDoesNotRecurse pins refreshTokens calling
+// doJSON rather than do: if it called do instead, a 401 from /user/refresh
+// itself would trigger another refreshTokens call from inside the first
+// one's do — which would find c.inflight already set by the outer call and
+// block forever waiting for a channel that only the outer call (itself
+// blocked on this same inner call) can close. With a real context.Background
+// caller that deadlocks permanently; here it would eventually be released by
+// the context deadline below, so a bounded elapsed-time check is what
+// actually distinguishes "fixed promptly" from "only stopped because the
+// test's own timeout intervened" — go test's pass/fail alone would not catch
+// this mutation, since blocking until ctx expires still produces a non-nil
+// error and exactly one /user/refresh call.
+func TestRefreshExpiredRefreshTokenDoesNotRecurse(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			atomic.AddInt32(&refreshCalls, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"refresh token expired"}`))
+		case "/thing":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"Unauthorized"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	const budget = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	start := time.Now()
+	err := c.do(ctx, http.MethodGet, "/thing", nil, nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("do returned nil error, want the original 401")
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 1 {
+		t.Errorf("/user/refresh called %d times, want exactly 1 (no recursion)", got)
+	}
+	// A correct implementation resolves in well under a second; a deadlocked
+	// one only returns once the context deadline fires, so an elapsed time
+	// anywhere near budget means the deadlock happened and the deadline —
+	// not the code — is what stopped it.
+	if elapsed > budget/2 {
+		t.Errorf("do took %s, want well under %s — this smells like it only stopped because the context deadline fired, i.e. a deadlock", elapsed, budget)
+	}
+}
+
+// TestDoDoesNotRefreshWithoutToken pins the stale == "" guard in do: a
+// client with no access token at all (never logged in) getting a 401 from
+// some endpoint must not attempt a refresh — there is no session to refresh.
+func TestDoDoesNotRefreshWithoutToken(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user/refresh" {
+			atomic.AddInt32(&refreshCalls, 1)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{})
+	err := c.do(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil {
+		t.Fatal("do returned nil error on a 401, want error")
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 0 {
+		t.Errorf("/user/refresh called %d times, want 0 — no token means nothing to refresh", got)
+	}
+}
+
+// TestDoConcurrentRequestsAllSucceed exercises the whole stack under load:
+// many goroutines simultaneously hit an endpoint that 401s until the client
+// refreshes, and every one of them must come back with a success — with
+// /user/refresh hit exactly once, proving the single-flight guard covers the
+// do path as well as direct refreshTokens calls (TestRefreshIsSingleFlight).
+func TestDoConcurrentRequestsAllSucceed(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			atomic.AddInt32(&refreshCalls, 1)
+			time.Sleep(10 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"name":"ok"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	const n = 20
+	var wg sync.WaitGroup
+	var failures int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var out struct {
+				Name string `json:"name"`
+			}
+			if err := c.do(context.Background(), http.MethodGet, "/thing", nil, &out); err != nil || out.Name != "ok" {
+				atomic.AddInt32(&failures, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&failures); got != 0 {
+		t.Errorf("%d of %d concurrent do calls failed, want 0", got, n)
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 1 {
+		t.Errorf("/user/refresh called %d times, want exactly 1", got)
 	}
 }

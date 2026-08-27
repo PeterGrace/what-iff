@@ -2226,6 +2226,43 @@ Three smaller issues came out of the same review pass:
 - Create: `internal/cli/client/auth.go`
 - Test: `internal/cli/client/auth_test.go`
 
+#### Why `refreshTokens` returns `(refreshed bool, err error)` instead of `error`
+
+A naive `refreshTokens(ctx, staleAccess) error` conflates two different
+failures: the token *exchange* against `/user/refresh` failing (the refresh
+token itself is dead — nothing to retry with), and the subsequent *persist*
+via `OnRefresh` failing (a read-only credentials file, a full disk — the
+client is holding perfectly good tokens in memory, it just couldn't write
+them to disk). If persisting fails, the caller (`do`, Task 6) has a choice:
+treat it as a hard failure and return the original 401 for the rest of the
+process's life, or retry anyway because the in-memory tokens are fine. The
+right answer is the second one — a `chmod -w` on the credentials file
+shouldn't break every authenticated request until the process restarts.
+
+The two-value return makes that distinction visible at the call site instead
+of forcing the caller to inspect error internals: `refreshed` says whether
+the exchange succeeded (retry-worthy or not), `err` carries diagnostic detail
+that a caller may log but must not use to decide whether to retry. See
+`TestRefreshSucceedsWhenPersistFails` and (in Task 6) `TestDoSucceedsWhenPersistFails`.
+
+#### Why a refresh waiter re-reads the token instead of trusting `<-existing`
+
+The single-flight guard means only one goroutine ("the leader") actually
+calls `/user/refresh`; everyone else ("waiters") blocks on the leader's
+`inflight` channel and wakes when it closes. A version of this that just
+returns success once the channel closes is wrong: if the leader's exchange
+failed, every waiter would believe it succeeded and retry with the same
+stale, already-401'd token — one guaranteed-doomed extra round trip per
+waiter.
+
+The fix doesn't add a second piece of shared state (an error field or
+channel) to carry the leader's outcome — that would itself need
+synchronizing, and could race with the leader clearing `c.inflight`. Instead,
+each waiter re-reads `c.tokens.Access` under the mutex after the channel
+closes and compares it to the `staleAccess` it saw fail: a changed access
+token is proof the leader's exchange succeeded, because only a successful
+exchange changes it. See `TestRefreshWaitersLearnLeaderFailure`.
+
 - [ ] **Step 1: Write the failing test**
 
 ```go
@@ -2234,9 +2271,13 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
@@ -2245,9 +2286,13 @@ func TestLoginStoresTokens(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/user/login" {
 			t.Errorf("path = %q, want /user/login", r.URL.Path)
+			return
 		}
 		var req models.UserLoginRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request body: %v", err)
+			return
+		}
 		if req.Username != "pete" || req.Password != "hunter2" {
 			t.Errorf("credentials = %q/%q, want pete/hunter2", req.Username, req.Password)
 		}
@@ -2275,7 +2320,10 @@ func TestLoginStoresTokens(t *testing.T) {
 func TestRefreshReplacesTokensAndPersists(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req models.RefreshTokenRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request body: %v", err)
+			return
+		}
 		if req.RefreshToken != "ref-1" {
 			t.Errorf("refresh_token = %q, want ref-1", req.RefreshToken)
 		}
@@ -2293,8 +2341,12 @@ func TestRefreshReplacesTokensAndPersists(t *testing.T) {
 		return nil
 	}
 
-	if err := c.refreshTokens(context.Background(), "acc-1"); err != nil {
+	refreshed, err := c.refreshTokens(context.Background(), "acc-1")
+	if err != nil {
 		t.Fatalf("refreshTokens returned %v", err)
+	}
+	if !refreshed {
+		t.Error("refreshed = false, want true")
 	}
 	if got := c.Tokens(); got.Access != "acc-2" {
 		t.Errorf("access = %q, want acc-2", got.Access)
@@ -2329,10 +2381,68 @@ func TestRefreshIsSingleFlight(t *testing.T) {
 		t.Errorf("refresh endpoint called %d times, want exactly 1", got)
 	}
 }
-```
 
-Add `"sync"`, `"sync/atomic"`, and `"time"` to the test file's import block for
-the single-flight test.
+// TestRefreshSucceedsWhenPersistFails: OnRefresh (the persist step) fails,
+// but the exchange itself succeeded — refreshed must be true and the
+// in-memory tokens must be the new ones even though err is non-nil. See
+// "Why refreshTokens returns (refreshed bool, err error)" above.
+func TestRefreshSucceedsWhenPersistFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(models.LoginResponse{AccessToken: "acc-2", RefreshToken: "ref-2"})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	c.OnRefresh = func(Tokens) error {
+		return errors.New("disk full")
+	}
+
+	refreshed, err := c.refreshTokens(context.Background(), "acc-1")
+	if !refreshed {
+		t.Error("refreshed = false, want true (the exchange succeeded even though persisting failed)")
+	}
+	if err == nil {
+		t.Error("err = nil, want the persist error to be reported")
+	}
+	if got := c.Tokens(); got.Access != "acc-2" || got.Refresh != "ref-2" {
+		t.Errorf("tokens = %+v, want acc-2/ref-2 in memory regardless of the persist failure", got)
+	}
+}
+
+// TestRefreshWaitersLearnLeaderFailure: when the leader's exchange fails,
+// every waiter parked on c.inflight must learn that rather than report
+// success and hand the caller a still-stale token. See "Why a refresh waiter
+// re-reads the token" above.
+func TestRefreshWaitersLearnLeaderFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"refresh token expired"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	const n = 8
+	results := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			refreshed, _ := c.refreshTokens(context.Background(), "acc-1")
+			results[i] = refreshed
+		}(i)
+	}
+	wg.Wait()
+
+	for i, refreshed := range results {
+		if refreshed {
+			t.Errorf("goroutine %d: refreshed = true, want false — the leader's exchange failed", i)
+		}
+	}
+}
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2346,6 +2456,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/theimaginaryfoundation/what-iff/internal/models"
@@ -2353,6 +2464,10 @@ import (
 
 // Login exchanges credentials for a token pair and stores it on the client.
 // usernameOrEmail matches the server, which accepts either.
+//
+// Login calls doJSON directly rather than do: there is no token to refresh
+// yet, so the 401-retry wrapper has nothing to add here and would only add a
+// pointless extra accessToken() read.
 func (c *Client) Login(ctx context.Context, usernameOrEmail, password string) (models.UserResponse, error) {
 	req := models.UserLoginRequest{Username: usernameOrEmail, Password: password}
 	var resp models.LoginResponse
@@ -2363,31 +2478,60 @@ func (c *Client) Login(ctx context.Context, usernameOrEmail, password string) (m
 	return resp.User, nil
 }
 
+// setTokens replaces the client's token pair under the mutex.
 func (c *Client) setTokens(t Tokens) {
 	c.mu.Lock()
 	c.tokens = t
 	c.mu.Unlock()
 }
 
-// refreshTokens exchanges the refresh token for a new pair.
+// refreshTokens exchanges the refresh token for a new pair. It reports
+// whether the exchange itself succeeded, separately from any error.
+//
+// The distinction matters: a failed *persist* (read-only credentials file,
+// full disk) still leaves the client holding usable tokens in memory, so the
+// caller (do) should retry the request rather than fail it. Only a failed
+// *exchange* means the request cannot succeed. So:
+//
+//   - exchange fails: (false, err).
+//   - exchange succeeds, no OnRefresh, or OnRefresh returns nil: (true, nil).
+//   - exchange succeeds but OnRefresh errors: (true, wrappedErr) — the new
+//     tokens are adopted in memory first, then OnRefresh is called, so the
+//     error reflects only the persist step.
+//   - another goroutine already refreshed (see staleAccess below): (true, nil).
 //
 // staleAccess is the access token the caller saw fail. If the client's token
 // has already moved on, another goroutine refreshed first and this returns
 // immediately — so a burst of concurrent 401s produces exactly one refresh
 // request rather than a stampede against /user/refresh.
-func (c *Client) refreshTokens(ctx context.Context, staleAccess string) error {
+//
+// refreshTokens calls doJSON, never do: do calls refreshTokens on a 401, so
+// going through do here would recurse the moment a refresh token itself came
+// back expired.
+func (c *Client) refreshTokens(ctx context.Context, staleAccess string) (bool, error) {
 	c.mu.Lock()
 	if c.tokens.Access != staleAccess {
 		c.mu.Unlock()
-		return nil
+		return true, nil
 	}
 	if existing := c.inflight; existing != nil {
 		c.mu.Unlock()
 		select {
 		case <-existing:
-			return nil
+			// The leader's outcome isn't stored anywhere — inferring it from
+			// whether the token moved avoids a second piece of shared state
+			// (an error channel/field) that would itself need synchronizing
+			// and could race with the leader clearing c.inflight. A changed
+			// access token is proof the leader's exchange succeeded; if it
+			// didn't succeed, the token is still staleAccess and the waiter
+			// correctly reports failure rather than retrying with a token
+			// that's known to be dead.
+			c.mu.Lock()
+			changed := c.tokens.Access != staleAccess
+			c.mu.Unlock()
+			return changed, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 	}
 	done := make(chan struct{})
@@ -2409,12 +2553,18 @@ func (c *Client) refreshTokens(ctx context.Context, staleAccess string) error {
 	close(done)
 
 	if err != nil {
-		return err
+		return false, err
 	}
+
+	// The exchange succeeded and the new tokens are already live in memory
+	// (set above, before OnRefresh runs) — so a persist failure below is
+	// reported through err but must not flip the reported bool to false.
 	if c.OnRefresh != nil {
-		return c.OnRefresh(updated)
+		if persistErr := c.OnRefresh(updated); persistErr != nil {
+			return true, fmt.Errorf("persisting refreshed tokens: %w", persistErr)
+		}
 	}
-	return nil
+	return true, nil
 }
 ```
 
@@ -2437,19 +2587,47 @@ git commit -m "feat(cli): login and single-flight token refresh"
 - Modify: `internal/cli/client/client.go`
 - Test: `internal/cli/client/client_test.go`
 
+#### Why `do` retries whenever `refreshed` is true, ignoring `refreshErr`
+
+Task 5's `refreshTokens` separates "the exchange succeeded" from "the persist
+succeeded" precisely so `do` can act on the first and ignore the second. If
+`do` failed the request whenever `refreshTokens` returned any error at all —
+including a persist error — then a read-only credentials file or a full disk
+would turn every single authenticated request into a failure for the rest of
+the process's life, even though the client is holding a perfectly valid
+access token in memory the whole time. `do` retries on `refreshed == true`
+regardless of `refreshErr`, and there's no logger in this package (nothing
+else in `internal/cli` logs either) to hand `refreshErr` to, so it's dropped
+rather than routed somewhere that would itself risk failing the request. See
+`TestDoSucceedsWhenPersistFails`.
+
+#### Why the `stale`-read-before-`doJSON` race is left alone
+
+`do` reads `stale := c.accessToken()` before calling `doJSON`, which re-reads
+the token itself (under the mutex) when it builds the request. A concurrent
+refresh landing in the gap between those two reads means `stale` might not be
+the token actually sent on the wire — so if `doJSON` comes back 401, the
+retry could in rare cases be triggered by a token that wasn't `stale` at all.
+This is deliberately left unfixed: the worst case is one extra 401 round
+trip, and closing the gap would mean threading an explicit token parameter
+through `doJSON`, breaking its signature and its 24 existing tests, for a
+race with no user-visible consequence.
+
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/cli/client/client_test.go`:
+Append to `internal/cli/client/client_test.go`. Add `"errors"` and `"sync"`
+to its import block if not already present (`"sync/atomic"` and `"time"` are
+already imported by Task 4's tests).
 
 ```go
 func TestDoRetriesOnceAfter401(t *testing.T) {
-	var thingCalls int
+	var thingCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/user/refresh":
 			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
 		case "/thing":
-			thingCalls++
+			atomic.AddInt32(&thingCalls, 1)
 			if r.Header.Get("Authorization") != "Bearer acc-2" {
 				w.WriteHeader(http.StatusUnauthorized)
 				w.Write([]byte(`{"message":"Unauthorized"}`))
@@ -2473,19 +2651,19 @@ func TestDoRetriesOnceAfter401(t *testing.T) {
 	if out.Name != "ok" {
 		t.Errorf("Name = %q, want ok", out.Name)
 	}
-	if thingCalls != 2 {
-		t.Errorf("/thing called %d times, want 2 (one 401, one retry)", thingCalls)
+	if got := atomic.LoadInt32(&thingCalls); got != 2 {
+		t.Errorf("/thing called %d times, want 2 (one 401, one retry)", got)
 	}
 }
 
 func TestDoDoesNotRetryTwice(t *testing.T) {
-	var thingCalls int
+	var thingCalls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user/refresh" {
 			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
 			return
 		}
-		thingCalls++
+		atomic.AddInt32(&thingCalls, 1)
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"message":"Unauthorized"}`))
 	}))
@@ -2496,8 +2674,179 @@ func TestDoDoesNotRetryTwice(t *testing.T) {
 	if err == nil {
 		t.Fatal("do returned nil error on a persistent 401, want error")
 	}
-	if thingCalls != 2 {
-		t.Errorf("/thing called %d times, want 2 — one retry only, no loop", thingCalls)
+	if got := atomic.LoadInt32(&thingCalls); got != 2 {
+		t.Errorf("/thing called %d times, want 2 — one retry only, no loop", got)
+	}
+}
+
+// TestDoSucceedsWhenPersistFails is the full-path regression test for design
+// correction 1: OnRefresh fails to persist the refreshed tokens, but the
+// exchange itself succeeded, so the retried request must still succeed
+// rather than surfacing the original 401.
+func TestDoSucceedsWhenPersistFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"name":"ok"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+	c.OnRefresh = func(Tokens) error {
+		return errors.New("read-only credentials file")
+	}
+
+	var out struct {
+		Name string `json:"name"`
+	}
+	if err := c.do(context.Background(), http.MethodGet, "/thing", nil, &out); err != nil {
+		t.Fatalf("do returned %v, want success despite the persist failure", err)
+	}
+	if out.Name != "ok" {
+		t.Errorf("Name = %q, want ok", out.Name)
+	}
+}
+
+// TestRefreshExpiredRefreshTokenDoesNotRecurse pins refreshTokens calling
+// doJSON rather than do: if it called do instead, a 401 from /user/refresh
+// itself would trigger another refreshTokens call from inside the first
+// one's do — which would find c.inflight already set by the outer call and
+// block forever waiting for a channel that only the outer call (itself
+// blocked on this same inner call) can close. With a real context.Background
+// caller that deadlocks permanently; here it would eventually be released by
+// the context deadline below, so a bounded elapsed-time check is what
+// actually distinguishes "fixed promptly" from "only stopped because the
+// test's own timeout intervened" — go test's pass/fail alone would not catch
+// this mutation, since blocking until ctx expires still produces a non-nil
+// error and exactly one /user/refresh call.
+func TestRefreshExpiredRefreshTokenDoesNotRecurse(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			atomic.AddInt32(&refreshCalls, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"refresh token expired"}`))
+		case "/thing":
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"Unauthorized"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	const budget = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	start := time.Now()
+	err := c.do(ctx, http.MethodGet, "/thing", nil, nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("do returned nil error, want the original 401")
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 1 {
+		t.Errorf("/user/refresh called %d times, want exactly 1 (no recursion)", got)
+	}
+	// A correct implementation resolves in well under a second; a deadlocked
+	// one only returns once the context deadline fires, so an elapsed time
+	// anywhere near budget means the deadlock happened and the deadline —
+	// not the code — is what stopped it.
+	if elapsed > budget/2 {
+		t.Errorf("do took %s, want well under %s — this smells like it only stopped because the context deadline fired, i.e. a deadlock", elapsed, budget)
+	}
+}
+
+// TestDoDoesNotRefreshWithoutToken pins the stale == "" guard in do: a
+// client with no access token at all (never logged in) getting a 401 from
+// some endpoint must not attempt a refresh — there is no session to refresh.
+func TestDoDoesNotRefreshWithoutToken(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user/refresh" {
+			atomic.AddInt32(&refreshCalls, 1)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{})
+	err := c.do(context.Background(), http.MethodGet, "/thing", nil, nil)
+	if err == nil {
+		t.Fatal("do returned nil error on a 401, want error")
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 0 {
+		t.Errorf("/user/refresh called %d times, want 0 — no token means nothing to refresh", got)
+	}
+}
+
+// TestDoConcurrentRequestsAllSucceed exercises the whole stack under load:
+// many goroutines simultaneously hit an endpoint that 401s until the client
+// refreshes, and every one of them must come back with a success — with
+// /user/refresh hit exactly once, proving the single-flight guard covers the
+// do path as well as direct refreshTokens calls (TestRefreshIsSingleFlight).
+func TestDoConcurrentRequestsAllSucceed(t *testing.T) {
+	var refreshCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/refresh":
+			atomic.AddInt32(&refreshCalls, 1)
+			time.Sleep(10 * time.Millisecond)
+			w.Write([]byte(`{"access_token":"acc-2","refresh_token":"ref-2"}`))
+		case "/thing":
+			if r.Header.Get("Authorization") != "Bearer acc-2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Write([]byte(`{"name":"ok"}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, Tokens{Access: "acc-1", Refresh: "ref-1"})
+
+	const n = 20
+	var wg sync.WaitGroup
+	var failures int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var out struct {
+				Name string `json:"name"`
+			}
+			if err := c.do(context.Background(), http.MethodGet, "/thing", nil, &out); err != nil || out.Name != "ok" {
+				atomic.AddInt32(&failures, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&failures); got != 0 {
+		t.Errorf("%d of %d concurrent do calls failed, want 0", got, n)
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 1 {
+		t.Errorf("/user/refresh called %d times, want exactly 1", got)
 	}
 }
 ```
@@ -2509,12 +2858,19 @@ Expected: FAIL — `c.do undefined`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `internal/cli/client/client.go`:
+Add to `internal/cli/client/client.go`. Add `"errors"` to its import block.
 
 ```go
 // do performs a request, refreshing the access token once and retrying if the
 // server rejects it. Every caller outside this file uses do, not doJSON, so a
 // two-hour access token expiring mid-session is invisible to the user.
+//
+// stale is read before doJSON, which re-reads the token itself under the
+// mutex; a concurrent refresh landing in the gap between the two reads means
+// stale may not be the token actually sent on the wire. That's a benign
+// race, deliberately left alone: worst case is one extra 401 round trip, and
+// fixing it would mean threading an explicit token through doJSON — breaking
+// its signature and its 24 existing tests — for no user-visible gain.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	stale := c.accessToken()
 	err := c.doJSON(ctx, method, path, body, out)
@@ -2523,22 +2879,44 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
 		return err
 	}
+	// No token was sent at all, so a fresh one wouldn't change anything —
+	// refreshing here would just be an extra round trip against
+	// /user/refresh with a refresh token that has nothing to do with this
+	// 401 (an unauthenticated endpoint, a client with no session yet).
 	if stale == "" {
 		return err
 	}
-	if refreshErr := c.refreshTokens(ctx, stale); refreshErr != nil {
+
+	refreshed, refreshErr := c.refreshTokens(ctx, stale)
+	if !refreshed {
+		// The exchange itself failed (or the caller's context was canceled
+		// while waiting on another goroutine's exchange) — no new token
+		// exists to retry with, so the original 401 is the right error to
+		// surface.
 		return err
 	}
+	// The exchange succeeded — the client now holds a usable access token in
+	// memory — even if refreshErr is non-nil, which can only mean the
+	// *persist* step (OnRefresh) failed. A failed write to the credentials
+	// file must not fail this request: the retry below can still succeed,
+	// and will keep succeeding for the rest of the process's in-memory
+	// session even though the on-disk copy is stale. There is no logger
+	// wired into this package yet (nothing else in internal/cli logs either)
+	// and no other channel back to the caller that wouldn't also fail the
+	// request, so refreshErr is deliberately dropped here rather than
+	// invented a reporting path for; the alternative — failing the request —
+	// is exactly the regression this function exists to avoid.
+	_ = refreshErr
 	return c.doJSON(ctx, method, path, body, out)
 }
 ```
 
-Add `"errors"` to the import block in `client.go`.
-
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/cli/client/ -race -v`
-Expected: PASS, all client tests.
+Run: `go test ./internal/cli/client/ -race -count=5 -v`
+Expected: PASS, all client tests. `-count=5` matters here — single-flight and
+concurrency bugs are intermittent, and this is the one package in the
+milestone where that risk is real.
 
 - [ ] **Step 5: Commit**
 
