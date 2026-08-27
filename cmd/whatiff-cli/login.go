@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +20,27 @@ import (
 // and no password environment variable, matching cmd/create-superuser: a flag
 // would put the password in shell history and in every process listing on the
 // machine.
-func runLogin(ctx context.Context, profileName string) error {
+//
+// login takes no flags and no positional arguments, but it still runs its
+// args through an empty FlagSet via parseSubFlags rather than dropping them
+// on the floor: without this, `wi login --help` silently started an
+// interactive login prompt instead of printing usage, and `wi login extra
+// --nonsense` silently ignored both instead of erroring — the same
+// stdout/exit-0 (help) and stderr/exit-2 (bad usage) convention chats
+// already follows was simply never wired up for this command. NArg() is
+// checked explicitly afterward because flag.FlagSet does not itself reject
+// leftover positional arguments (it just stops parsing at the first one).
+func runLogin(ctx context.Context, profileName string, args []string) error {
+	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	if err := parseSubFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "wi login: unexpected argument %q\n", fs.Arg(0))
+		printSubUsage(fs, os.Stderr)
+		return errFlagUsage
+	}
+
 	name, profile, err := loadProfile(profileName)
 	if err != nil {
 		return err

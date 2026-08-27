@@ -2,9 +2,32 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// TestRunLogin_HelpFlag and TestRunLogin_UnexpectedArgument pin runLogin's
+// flag handling directly, without touching the network or a terminal:
+// both the help path and the argument-rejection path return before
+// loadProfile is ever called, so they are reachable from a plain unit test -
+// unlike the rest of runLogin, which talks to a real client and a real TTY
+// and is exercised only by the milestone's live end-to-end check (see
+// docs/superpowers/plans/2026-08-27-whatiff-cli-foundation.md, Task 11).
+func TestRunLogin_HelpFlag(t *testing.T) {
+	err := runLogin(context.Background(), "", []string{"--help"})
+	if !errors.Is(err, errHelpRequested) {
+		t.Errorf("runLogin(--help) = %v, want errHelpRequested", err)
+	}
+}
+
+func TestRunLogin_UnexpectedArgument(t *testing.T) {
+	err := runLogin(context.Background(), "", []string{"extra", "--nonsense"})
+	if !errors.Is(err, errFlagUsage) {
+		t.Errorf("runLogin(extra, --nonsense) = %v, want errFlagUsage", err)
+	}
+}
 
 // TestPromptLine_SharedReaderSeesBothLines exercises promptLine reading two
 // sequential lines off one shared *bufio.Reader.

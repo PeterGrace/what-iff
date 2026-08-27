@@ -25,7 +25,7 @@ milestone 2.
 
 - `main`, `run(ctx, command, args, profileName, asJSON)`.
 - `session`, `newSession(profileName)`, `loadProfile(profileName)`.
-- `runLogin(ctx, profileName)`, `runChats(ctx, profileName, asJSON, args)`.
+- `runLogin(ctx, profileName, args)`, `runChats(ctx, profileName, asJSON, args)`.
 - `parseSubFlags`, `errHelpRequested`, `errFlagUsage` — shared subcommand
   flag-parsing that keeps `wi --help` and `wi chats --help` on the same
   stdout/exit-0 vs. stderr/exit-2 convention.
@@ -89,14 +89,22 @@ milestone 2.
 - `main_test.go` — profile resolution fallback and error-wrapping in
   `loadProfile`, `newSession`'s `OnRefresh` closure preserving the stored
   username across a refresh.
+- `flags_test.go` — `parseSubFlags` (help sentinel, usage-error sentinel,
+  clean parse), `printSubUsage`, top-level `usage`, and `run`'s dispatch to
+  the right subcommand FlagSet (including the unknown-command case) — all
+  pure functions over a `*flag.FlagSet`/`io.Writer` with no network or
+  terminal dependency, at 100% coverage.
 - `login_test.go` — `promptLine`'s shared-reader requirement (piped/heredoc
-  input, not just an interactive terminal), `validateUsername`.
+  input, not just an interactive terminal), `validateUsername`, and
+  `runLogin`'s `--help`/unexpected-argument guard paths (both return before
+  `loadProfile`, so they're reachable without a network or a terminal).
 - `chats_test.go` — `truncationNotice`, `humanizeSince`, `sanitizeCell`,
   `normalizeResultsForJSON` (nil-vs-empty `results`).
-- No test exercises `runLogin`/`runChats` end to end — both talk to a real
-  network and a real terminal, which is exactly what Part E of this
-  milestone's live end-to-end check (see the repository root, not this
-  package) validates that automated tests can't.
+- No test exercises `runLogin`'s interactive prompt/network path or
+  `runChats` end to end — both talk to a real network and a real terminal,
+  which is exactly what the milestone's live end-to-end check
+  (`docs/superpowers/plans/2026-08-27-whatiff-cli-foundation.md`, Task 11)
+  validates that automated tests can't.
 - These behaviors were mutation-tested during milestone 1 review.
 
 ## Related
