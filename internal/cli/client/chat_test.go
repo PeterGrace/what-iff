@@ -2,11 +2,77 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"github.com/theimaginaryfoundation/what-iff/internal/models"
 )
+
+// TestChatPageMatchesPaginatedResponseEnvelope is the regression test for
+// ChatPage's one documented deviation from this package's own rule that
+// responses decode into internal/models types (see client.go's package
+// comment): ChatPage is a hand-maintained mirror of
+// internal/models.PaginatedResponse, not that type itself, because
+// PaginatedResponse.Results is []any and cannot decode into anything usable
+// on its own.
+//
+// Every other fixture in this file is a hand-written JSON literal, which
+// means a change to PaginatedResponse's json tags (e.g. "total_count"
+// renamed) would compile and pass every one of those tests on both sides
+// while wi chats silently printed "No chats found." - the two types would
+// have quietly stopped agreeing on the wire shape with nothing to catch it.
+//
+// This test closes that gap by using the real server type on one side: it
+// marshals an actual models.PaginatedResponse (so PaginatedResponse's own
+// json tags are what produce the bytes) and unmarshals the result into
+// ChatPage (so ChatPage's own tags are what consume them), then asserts the
+// fields survived the round trip. A tag drift on either side breaks this
+// test without needing a second, independent server-side test to catch it.
+func TestChatPageMatchesPaginatedResponseEnvelope(t *testing.T) {
+	chat := models.Chat{Name: "deploy plan", UnreadCount: 3}
+	chatJSON, err := json.Marshal(chat)
+	if err != nil {
+		t.Fatalf("marshaling models.Chat: %v", err)
+	}
+	// Round-trip through an untyped any so it sits inside
+	// PaginatedResponse.Results the same way json.Marshal of a real
+	// []models.Chat server-side response would - as decoded JSON, not a
+	// typed Go value.
+	var chatAny any
+	if err := json.Unmarshal(chatJSON, &chatAny); err != nil {
+		t.Fatalf("unmarshaling into any: %v", err)
+	}
+
+	envelope := models.PaginatedResponse{
+		Results:    []any{chatAny},
+		TotalCount: 42,
+		Page:       1,
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshaling models.PaginatedResponse: %v", err)
+	}
+
+	var page ChatPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Fatalf("unmarshaling into ChatPage: %v", err)
+	}
+	if len(page.Results) != 1 {
+		t.Fatalf("len(page.Results) = %d, want 1", len(page.Results))
+	}
+	if page.Results[0].Name != "deploy plan" {
+		t.Errorf("page.Results[0].Name = %q, want %q", page.Results[0].Name, "deploy plan")
+	}
+	if page.Results[0].UnreadCount != 3 {
+		t.Errorf("page.Results[0].UnreadCount = %d, want 3", page.Results[0].UnreadCount)
+	}
+	if page.TotalCount != 42 {
+		t.Errorf("page.TotalCount = %d, want 42", page.TotalCount)
+	}
+}
 
 func TestListChatsUnwrapsPaginationEnvelope(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

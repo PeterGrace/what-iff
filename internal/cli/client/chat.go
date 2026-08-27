@@ -27,6 +27,17 @@ type ListChatsOptions struct {
 // it yet, so it is deliberately left undecoded rather than kept as dead
 // weight — it can come back once pagination actually lands and something
 // reads it.
+//
+// ChatPage is this package's one deviation from decoding straight into
+// internal/models (see client.go's package comment): the server's actual
+// envelope is internal/models.PaginatedResponse, whose Results is []any and
+// therefore useless to decode into directly. ChatPage mirrors that
+// envelope's wire shape by hand, with Results typed as []models.Chat.
+// Because it's a hand-maintained mirror rather than the real type, a tag
+// change on PaginatedResponse would not be caught by the type system — see
+// TestChatPageMatchesPaginatedResponseEnvelope (chat_test.go), which
+// marshals a real models.PaginatedResponse and unmarshals it into ChatPage
+// specifically to guard against that drift.
 type ChatPage struct {
 	Results    []models.Chat `json:"results"`
 	TotalCount int           `json:"total_count"`

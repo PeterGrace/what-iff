@@ -35,6 +35,15 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
   client and server share the exact same request/response Go types, so they
   cannot silently disagree about a payload shape the way a separately
   vendored client could.
+- **`ChatPage` is the one documented exception to that rule.** The server
+  wraps a listing in `models.PaginatedResponse`, whose `Results []any` can't
+  decode into anything usable — so `ChatPage` hand-mirrors that envelope's
+  wire shape instead, with `Results` typed as `[]models.Chat`. Being a
+  hand-maintained mirror rather than the real type means a json-tag change on
+  `PaginatedResponse` would not be a compile error here; it's guarded instead
+  by `TestChatPageMatchesPaginatedResponseEnvelope` (`chat_test.go`), which
+  marshals a real `models.PaginatedResponse` and unmarshals it into
+  `ChatPage`, so the two decode compatibly rather than merely looking alike.
 - **`do` vs. `doJSON`, and why `refreshTokens` must call `doJSON`.**
   `refreshTokens` (`auth.go`) is invoked from `do` on a 401. If it went
   through `do` instead of `doJSON` to hit `/user/refresh`, a refresh-token
@@ -95,7 +104,9 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
 - `auth_test.go` — login token storage, refresh persistence vs. in-memory
   success, single-flight behavior (run with `-race`).
 - `chat_test.go` — pagination envelope unwrapping (including a null/missing
-  `results` field), query parameter construction.
+  `results` field), query parameter construction, and
+  `TestChatPageMatchesPaginatedResponseEnvelope` guarding `ChatPage` against
+  drift from `models.PaginatedResponse` (see "Non-obvious decisions" above).
 - These behaviors were mutation-tested during milestone 1 review, particularly
   the refresh single-flight and retry-once logic.
 

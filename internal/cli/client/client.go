@@ -3,6 +3,14 @@
 // Responses decode into internal/models types so the CLI and the server cannot
 // disagree about a payload shape — the same single-chokepoint discipline the
 // Playwright e2e SDK uses (web/app/e2e/sdk/client.ts).
+//
+// The one documented exception is ChatPage (chat.go): the server wraps a
+// listing in internal/models.PaginatedResponse, whose Results field is
+// []any and so cannot decode into anything a caller could use directly.
+// ChatPage is a hand-maintained mirror of that envelope's wire shape with
+// Results typed as []models.Chat instead. See
+// TestChatPageMatchesPaginatedResponseEnvelope (chat_test.go) for the test
+// that guards the two from silently drifting apart.
 package client
 
 import (
