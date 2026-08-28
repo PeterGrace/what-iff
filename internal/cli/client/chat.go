@@ -17,32 +17,6 @@ type ListChatsOptions struct {
 	Limit    int
 }
 
-// ChatPage is one page of a chat listing.
-//
-// TotalCount is returned alongside the results because a listing is capped by
-// the caller's limit: without it, a command showing 100 of 347 chats has no way
-// to say so, and a truncated list is indistinguishable from missing data.
-//
-// The server's envelope also carries a page number, but nothing here consumes
-// it yet, so it is deliberately left undecoded rather than kept as dead
-// weight — it can come back once pagination actually lands and something
-// reads it.
-//
-// ChatPage is this package's one deviation from decoding straight into
-// internal/models (see client.go's package comment): the server's actual
-// envelope is internal/models.PaginatedResponse, whose Results is []any and
-// therefore useless to decode into directly. ChatPage mirrors that
-// envelope's wire shape by hand, with Results typed as []models.Chat.
-// Because it's a hand-maintained mirror rather than the real type, a tag
-// change on PaginatedResponse would not be caught by the type system — see
-// TestChatPageMatchesPaginatedResponseEnvelope (chat_test.go), which
-// marshals a real models.PaginatedResponse and unmarshals it into ChatPage
-// specifically to guard against that drift.
-type ChatPage struct {
-	Results    []models.Chat `json:"results"`
-	TotalCount int           `json:"total_count"`
-}
-
 // ListChats returns one page of the user's chats. It calls do, not doJSON, so
 // an expired access token refreshes transparently — the same guarantee every
 // other resource call in this package gets.
@@ -73,4 +47,23 @@ func (c *Client) ListChats(ctx context.Context, opts ListChatsOptions) (ChatPage
 		return ChatPage{}, err
 	}
 	return page, nil
+}
+
+// CreateChat creates a chat with the given name and returns it.
+//
+// The body is deliberately just the name rather than a models.Chat: the
+// server falls back to the user's preferred model and personality when those
+// fields are absent (internal/datastore/chat.go's CreateChat), and
+// models.Chat's model_id/personality_id tags carry no omitempty, so marshaling
+// one would put explicit all-zero UUIDs on the wire where "unset" was meant.
+func (c *Client) CreateChat(ctx context.Context, name string) (models.Chat, error) {
+	body := struct {
+		Name string `json:"name"`
+	}{Name: name}
+
+	var chat models.Chat
+	if err := c.do(ctx, http.MethodPost, "/chat", body, &chat); err != nil {
+		return models.Chat{}, err
+	}
+	return chat, nil
 }

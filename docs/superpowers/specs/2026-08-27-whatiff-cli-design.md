@@ -93,6 +93,13 @@ type Turn struct {
 `RemoteEngine` is the only implementation in phase 1. A `LocalEngine` can be
 added later without touching the TUI.
 
+Shipped in issue #4 as `internal/cli/engine`; see that package's
+`_PACKAGE_SUMMARY.md` for the decisions the interface alone does not show.
+Two additions to the sketch above: `Turn` also carries `ChatID`,
+`UserMessageID` and `JobID` (a consumer needs the message id to `Resume`
+later, and the job id for `--json`), and `Resume` returns `ErrNoActiveTurn`
+when the turn it was asked about has already finished.
+
 ## Data flow: one turn
 
 1. `POST /api/chat/{id}/chat-message` `{message, origin:"User"}` → `202 {id, job_id}`
@@ -105,8 +112,19 @@ added later without touching the TUI.
    remaining phases (`expression_complete` → `compaction_complete` → `complete`)
    finish in the background behind a subtle indicator. Blocking until `complete`
    would make the CLI feel slower than the browser for no benefit.
-5. `GET /api/chat/{id}/chat-message?limit=N` reconciles the final persisted
-   message — tool calls, attachments, and the model/persona actually used.
+5. The finished turn is reconciled against the persisted assistant message —
+   tool calls, attachments, the model/persona actually used, and the per-turn
+   token breakdown.
+
+   > **Superseded (issue #4).** Shipped reconciling through the job's
+   > `result_id` and `GET /api/chat/chat-message/{id}`, not a
+   > `?limit=N` listing. The server sets `result_id` atomically with
+   > `inference_complete`, and again when a cancelled turn's partial draft is
+   > promoted to a real message, so it is exact even when two turns in the
+   > same chat overlap — which "the newest assistant message in the last N"
+   > cannot be. A nil `result_id` means the turn produced no message at all
+   > (cancelled before the first token) rather than "look further back". See
+   > `watcher.reconcile` in `internal/cli/engine/poll.go`.
 
 Job status order is defined in `internal/models/job.go:13-22`.
 
@@ -181,6 +199,13 @@ creates a new chat for the turn.
 
 Streams when stdout is a TTY, buffers when piped. Exit code reflects terminal
 job status. `--json` emits `{chat_id, message, model, tokens, job_id}`.
+
+As shipped (issue #4): `--quiet` prints the reply and nothing else, suppressing
+the advisory lines (the id of a chat the turn created, attachment names) that
+otherwise go to stderr. `tokens` comes from the assistant message's
+`context_breakdown.total_tokens` and is omitted, not zeroed, when the server
+captured no breakdown for the turn. A chat created for a turn is named after
+the prompt's first line so it is findable in `wi chats` afterwards.
 
 ### Attachments
 

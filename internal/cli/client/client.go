@@ -4,13 +4,13 @@
 // disagree about a payload shape — the same single-chokepoint discipline the
 // Playwright e2e SDK uses (web/app/e2e/sdk/client.ts).
 //
-// The one documented exception is ChatPage (chat.go): the server wraps a
-// listing in internal/models.PaginatedResponse, whose Results field is
-// []any and so cannot decode into anything a caller could use directly.
-// ChatPage is a hand-maintained mirror of that envelope's wire shape with
-// Results typed as []models.Chat instead. See
-// TestChatPageMatchesPaginatedResponseEnvelope (chat_test.go) for the test
-// that guards the two from silently drifting apart.
+// The one documented exception is Page (page.go): the server wraps a listing
+// in internal/models.PaginatedResponse, whose Results field is []any and so
+// cannot decode into anything a caller could use directly. Page is a
+// hand-maintained mirror of that envelope's wire shape, generic over the
+// element type its aliases pin down (ChatPage, ChatMessagePage). See
+// TestPageMatchesPaginatedResponseEnvelope (page_test.go) for the test that
+// guards the two from silently drifting apart.
 package client
 
 import (
@@ -175,7 +175,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("%s %s: %w", method, path, decodeAPIError(resp))
 	}
-	if out == nil {
+	// A 204 carries no body by definition, so there is nothing to decode even
+	// when the caller passed an out. Without this, an endpoint that answers
+	// 204 for "nothing here" (GET .../active-job when no job is running)
+	// would fail with a bogus "response was not JSON: empty response body"
+	// instead of leaving out at its zero value for the caller to recognize.
+	if out == nil || resp.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}

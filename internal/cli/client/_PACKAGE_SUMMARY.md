@@ -12,7 +12,9 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
   message, or a sanitized snippet when the body isn't the server's JSON error
   envelope.
 - Transparently refresh an expired access token and retry a request once.
-- Resource calls: `Login` (`auth.go`), `ListChats` (`chat.go`).
+- Resource calls: `Login` (`auth.go`), `ListChats`/`CreateChat` (`chat.go`),
+  `CreateChatMessage`/`GetChatMessage`/`GetActiveChatMessageJob`/
+  `ListChatMessages` (`chatmessage.go`), `GetJob`/`CancelJob` (`job.go`).
 
 ## Key types and entry points
 
@@ -21,13 +23,19 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
   401-refresh-and-retry behavior.
 - `Client.doJSON` — one request, no refresh handling; used by `Login` (no
   token to refresh yet) and internally by `refreshTokens` (see below).
-- `Client.Login`, `Client.ListChats`, `ListChatsOptions`, `ChatPage`.
+- `Client.Login`, `Client.ListChats`, `Client.CreateChat`, `ListChatsOptions`.
+- `Client.CreateChatMessage`, `CreateMessageRequest`, `Client.GetChatMessage`,
+  `Client.GetActiveChatMessageJob`, `Client.ListChatMessages`,
+  `ListChatMessagesOptions`.
+- `Client.GetJob`, `Client.CancelJob`.
+- `Page[T]` and its aliases `ChatPage`, `ChatMessagePage` (`page.go`).
 
 ## Dependencies
 
-- **Inbound:** `cmd/whatiff-cli` (the only caller today).
-- **Outbound:** `internal/models`; otherwise stdlib `net/http`,
-  `encoding/json`.
+- **Inbound:** `cmd/whatiff-cli`, `internal/cli/engine`,
+  `internal/cli/oneshot`.
+- **Outbound:** `internal/models`, `github.com/google/uuid`; otherwise stdlib
+  `net/http`, `encoding/json`.
 
 ## Non-obvious decisions
 
@@ -35,15 +43,17 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
   client and server share the exact same request/response Go types, so they
   cannot silently disagree about a payload shape the way a separately
   vendored client could.
-- **`ChatPage` is the one documented exception to that rule.** The server
+- **`Page[T]` is the one documented exception to that rule.** The server
   wraps a listing in `models.PaginatedResponse`, whose `Results []any` can't
-  decode into anything usable — so `ChatPage` hand-mirrors that envelope's
-  wire shape instead, with `Results` typed as `[]models.Chat`. Being a
-  hand-maintained mirror rather than the real type means a json-tag change on
-  `PaginatedResponse` would not be a compile error here; it's guarded instead
-  by `TestChatPageMatchesPaginatedResponseEnvelope` (`chat_test.go`), which
-  marshals a real `models.PaginatedResponse` and unmarshals it into
-  `ChatPage`, so the two decode compatibly rather than merely looking alike.
+  decode into anything usable — so `Page` hand-mirrors that envelope's wire
+  shape instead, generic over the element type its aliases pin down
+  (`ChatPage`, `ChatMessagePage`). Being a hand-maintained mirror rather than
+  the real type means a json-tag change on `PaginatedResponse` would not be a
+  compile error here; it's guarded instead by
+  `TestPageMatchesPaginatedResponseEnvelope` (`page_test.go`), which marshals
+  a real `models.PaginatedResponse` and unmarshals it into a `Page`, once per
+  aliased element type, so the two decode compatibly rather than merely
+  looking alike.
 - **`do` vs. `doJSON`, and why `refreshTokens` must call `doJSON`.**
   `refreshTokens` (`auth.go`) is invoked from `do` on a 401. If it went
   through `do` instead of `doJSON` to hit `/user/refresh`, a refresh-token
@@ -92,10 +102,24 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
   can legitimately be large, but an unbounded or infinite stream from a
   broken/hostile server still must not be allowed to force unbounded memory
   use.
-- **`ChatPage` carries `TotalCount` alongside `Results`** so a listing capped
-  by the caller's `Limit` isn't mistaken for the complete set — see
-  `chat.go:ChatPage` and `cmd/whatiff-cli/chats.go:truncationNotice`, which is
-  the entire reason this type exists over a bare `[]models.Chat`.
+- **`Page` carries `TotalCount` alongside `Results`** so a listing capped by
+  the caller's `Limit` isn't mistaken for the complete set — see
+  `page.go:Page` and `cmd/whatiff-cli/chats.go:truncationNotice`, which is the
+  entire reason this type exists over a bare slice.
+- **`doJSON` treats a 204 as "no body to decode", even with a non-nil `out`.**
+  `GetActiveChatMessageJob` answers 204 for "no job is running for that turn",
+  which is a normal answer; without the special case it surfaced as a bogus
+  "response was not JSON: empty response body". The caller distinguishes the
+  two by the zero `JobID` that a 204 leaves behind.
+- **`CreateChatMessage` fills in `origin: "User"` itself** rather than
+  exposing it on `CreateMessageRequest`. The server takes the origin from the
+  request body, so leaving it to callers is a way to accidentally post a turn
+  the transcript attributes to the assistant.
+- **`CreateChat` sends only `{"name": ...}`,** not a marshaled `models.Chat`.
+  The server falls back to the user's preferred model and personality when
+  those fields are absent, but `models.Chat`'s `model_id`/`personality_id`
+  tags carry no `omitempty`, so marshaling one would put explicit all-zero
+  UUIDs on the wire where "unset" was meant.
 
 ## Testing
 
@@ -104,9 +128,17 @@ The only place the `wi` CLI speaks HTTP to a WhatIff server.
 - `auth_test.go` — login token storage, refresh persistence vs. in-memory
   success, single-flight behavior (run with `-race`).
 - `chat_test.go` — pagination envelope unwrapping (including a null/missing
-  `results` field), query parameter construction, and
-  `TestChatPageMatchesPaginatedResponseEnvelope` guarding `ChatPage` against
-  drift from `models.PaginatedResponse` (see "Non-obvious decisions" above).
+  `results` field) and query parameter construction.
+- `page_test.go` — `TestPageMatchesPaginatedResponseEnvelope`, guarding
+  `Page` against drift from `models.PaginatedResponse` for every aliased
+  element type (see "Non-obvious decisions" above).
+- `chatmessage_test.go` — the forced `origin: "User"`, the omitted empty
+  timezone, hydrated-message decoding (including `context_breakdown`), the
+  active-job 200 and 204 paths, message-listing limits, and `CreateChat`'s
+  minimal body.
+- `job_test.go` — `draft_deltas` and `result_id` decoding, a 404 surfacing as
+  an `*APIError`, and `CancelJob` returning the job carrying the promoted
+  partial reply.
 - These behaviors were mutation-tested during milestone 1 review, particularly
   the refresh single-flight and retry-once logic.
 
