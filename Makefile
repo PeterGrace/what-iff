@@ -50,7 +50,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: pre-commit
-pre-commit: fmt vet tidy test build check-no-local-models check-compose-defaults check-public-hygiene ## Run all pre-commit checks (matches CI/CD)
+pre-commit: fmt vet tidy test build build-cli-crosscheck check-no-local-models check-compose-defaults check-public-hygiene ## Run all pre-commit checks (matches CI/CD)
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: fmt
@@ -109,6 +109,40 @@ build: $(ENT_SENTINEL) ## Verify build works
 		cmd/api-server/main.go
 	@rm -f bootstrap
 	@echo "✅ Build successful"
+
+.PHONY: build-cli-crosscheck
+# linux/aix/solaris share the "linux || aix || solaris" build tag on the
+# TCFLSH ioctl file (see cmd/whatiff-cli's tty_tcflsh.go and its
+# _PACKAGE_SUMMARY.md for the tty_linux.go filename trap this target exists
+# to catch) - aix and solaris are included here, not just linux, because a
+# filename-implied build constraint narrowing that tag silently would
+# otherwise only be caught by actually compiling for them. freebsd and
+# illumos exercise the BSD-ioctl (tty_bsd.go) and no-op (tty_other.go) paths
+# respectively; windows exercises tty_other.go on a wholly different OS
+# family. All five plus linux/darwin were confirmed to build during the
+# milestone 1 whole-milestone review.
+build-cli-crosscheck: ## Cross-compile the wi CLI for every supported platform (build only, catches platform-specific build-tag mistakes like a file name that silently narrows its own //go:build line)
+	@echo "Cross-compiling cmd/whatiff-cli for linux/amd64, darwin/amd64, darwin/arm64, freebsd/amd64, solaris/amd64, illumos/amd64, aix/ppc64, windows/amd64..."
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=solaris GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=illumos GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=aix GOARCH=ppc64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o /dev/null ./cmd/whatiff-cli
+	@echo "✅ wi cross-compiles for linux, darwin, freebsd, solaris, illumos, aix, windows"
+
+.PHONY: build-cli
+build-cli: ## Build the wi CLI for this machine into ./bin/wi
+	@mkdir -p bin
+	@go build -o bin/wi ./cmd/whatiff-cli
+	@echo "✅ built ./bin/wi"
+
+.PHONY: install-cli
+install-cli: ## Install the wi CLI via 'go install' ($(GOPATH)/bin or $(GOBIN))
+	@go install ./cmd/whatiff-cli
+	@echo "✅ installed as 'whatiff-cli' (go install names the binary after its directory, cmd/whatiff-cli — symlink it to 'wi' on your PATH, e.g.: ln -s \$$(go env GOPATH)/bin/whatiff-cli \$$(go env GOPATH)/bin/wi)"
 
 .PHONY: install-hooks
 install-hooks: ## Install git pre-commit hook

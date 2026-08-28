@@ -65,6 +65,14 @@ bootstrap
 /create-superuser
 /api-server
 /generate-test-conversations
+/whatiff-cli
+
+# wi CLI build output (go build -o bin/wi ./cmd/whatiff-cli, and the
+# build-cli/install-cli Makefile targets once added). Same rationale as
+# the cmd/ binaries above: rebuildable from source, ~20MB, easy to
+# commit by accident since it lands in a subdirectory rather than at
+# the repo root where the entries above would already catch it.
+/bin/
 
 # Local dev background API artifacts (make dev-up)
 .dev/

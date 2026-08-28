@@ -109,10 +109,10 @@ jobs:
           make generate
           echo "✅ Code generation complete"
 
-      # These mirror `make pre-commit` (fmt vet tidy build check-no-local-models
-      # check-compose-defaults check-public-hygiene) by calling the same
-      # targets, so the Makefile stays the single source of truth for what
-      # each check actually runs.
+      # These mirror `make pre-commit` (fmt vet tidy test build
+      # build-cli-crosscheck check-no-local-models check-compose-defaults
+      # check-public-hygiene) by calling the same targets, so the Makefile
+      # stays the single source of truth for what each check actually runs.
       - name: Check formatting
         run: make fmt
 
@@ -165,6 +165,15 @@ jobs:
 
       - name: Verify build
         run: make build
+
+      # Cross-compiles cmd/whatiff-cli for every supported GOOS/GOARCH,
+      # catching platform-specific build-tag mistakes that `make build`
+      # (linux/amd64 only) can't - e.g. a tty_*.go filename that silently
+      # narrows its own //go:build constraint (see build-cli-crosscheck's
+      # comment in the Makefile). This was in `make pre-commit` from the CLI
+      # milestone's first commit but had no CI step of its own until now.
+      - name: Cross-compile CLI for all supported platforms
+        run: make build-cli-crosscheck
 
   # Hermetic backend end-to-end run (scripts/mock-e2e.sh): own isolated
   # Postgres via docker compose, real register/login/chat/job pipeline
