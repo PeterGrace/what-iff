@@ -3710,6 +3710,17 @@ type ChatPage struct {
 	Results    []models.Chat `json:"results"`
 	TotalCount int           `json:"total_count"`
 }
+```
+
+> **Superseded (issue #4).** Milestone 2 needed a second paginated listing
+> (`ChatMessagePage`), so this struct became a generic `Page[T]` in
+> `internal/cli/client/page.go` with `ChatPage = Page[models.Chat]` as a type
+> alias — every use above still compiles and behaves identically, and the
+> rationale in the doc comment moved with it. The drift guard was renamed
+> and generalized to `TestPageMatchesPaginatedResponseEnvelope`
+> (`page_test.go`), which now runs once per aliased element type.
+
+```go
 
 // ListChats returns one page of the user's chats. It calls do, not doJSON, so
 // an expired access token refreshes transparently — the same guarantee every

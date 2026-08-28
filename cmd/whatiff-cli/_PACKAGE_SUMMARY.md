@@ -2,15 +2,19 @@
 
 ## Role
 
-`main` package for `wi`, the WhatIff terminal client. Milestone 1 wires
-`login` and `chats`; conversation handling arrives with the turn engine in
-milestone 2.
+`main` package for `wi`, the WhatIff terminal client. It wires `login` and
+`chats`, plus the non-interactive turn `wi -p`, which runs one prompt through
+`internal/cli/engine` and exits. The interactive TUI arrives in milestone 3.
 
 ## Responsibilities
 
 - Top-level flag/subcommand dispatch (`--profile`, `--json`, `login`,
   `chats`, `help`) with a help/usage-error exit-code split that matches
   `flag`'s own convention (`main.go`).
+- `-p`/`--prompt` (with `--chat` and `--quiet`): the non-interactive turn.
+  Reads piped stdin, decides streaming from whether stdout is a terminal,
+  resolves the local timezone, and hands the whole thing to
+  `internal/cli/oneshot` (`prompt.go`).
 - Build a `session` — resolved profile plus an authenticated
   `internal/cli/client.Client` wired to persist a refreshed token pair back
   to `internal/cli/config`.
@@ -26,6 +30,9 @@ milestone 2.
 - `main`, `run(ctx, command, args, profileName, asJSON)`.
 - `session`, `newSession(profileName)`, `loadProfile(profileName)`.
 - `runLogin(ctx, profileName, asJSON, args)`, `runChats(ctx, profileName, asJSON, args)`.
+- `runPrompt(ctx, profileName, oneshot.Options)`, `readPipedStdin`,
+  `localTimezone`, `promptExitError`.
+- `flagWasSet(fs, names...)`, `exitWith(err)`, `errSilentFailure`.
 - `parseSubFlags`, `errHelpRequested`, `errFlagUsage` — shared subcommand
   flag-parsing that keeps `wi --help` and `wi chats --help` on the same
   stdout/exit-0 vs. stderr/exit-2 convention.
@@ -36,7 +43,8 @@ milestone 2.
 
 - **Inbound:** none (this is a binary's `main` package).
 - **Outbound:** `internal/cli/client`, `internal/cli/config`,
-  `internal/models`; `golang.org/x/term`, `golang.org/x/sys/unix`.
+  `internal/cli/engine`, `internal/cli/oneshot`, `internal/models`;
+  `golang.org/x/term`, `golang.org/x/sys/unix`.
 
 ## Non-obvious decisions
 
@@ -52,6 +60,31 @@ milestone 2.
   one given wins, regardless of which side of the subcommand name it's on.
   `login` accepts `--json` even though it has no JSON output mode, purely so
   both global flags behave identically after every subcommand.
+- **`-p` is dispatched on whether the flag was *given*, not on its value**
+  (`flagWasSet`). `echo hi | wi -p ""` is a legitimate way to send a piped
+  document with no instruction of its own; a check on the value would treat
+  that as "no `-p`" and print the usage text instead. `-p` and `--prompt`
+  bind to the same variable, so either spelling works.
+- **`-p` takes no positional arguments.** `wi -p summarize the deploy` would
+  otherwise send only "summarize" and silently drop the rest; the guard says
+  to quote the whole prompt instead.
+- **Piped stdin is read only when stdin is not a character device.** Reading
+  unconditionally would make an interactive `wi -p "hello"` hang forever
+  waiting for an EOF the user has no reason to think they owe it. The read is
+  capped at 8MB so `cat /dev/zero | wi -p` fails with an error rather than
+  exhausting memory.
+- **Streaming is decided by `term.IsTerminal(stdout)`,** not by a flag: a
+  human watching text appear wants it streamed, a pipe wants one clean write,
+  and both `wi -p x` and `wi -p x | tee log` then behave the way they look.
+- **`localTimezone` prefers `$TZ` and distrusts Go's placeholder.** Go names a
+  zone loaded from `/etc/localtime` `"Local"`, which is not an IANA name and
+  would be worse to send than nothing; `$TZ` is the one place a user can
+  state the answer explicitly.
+- **`errSilentFailure` is the third sentinel of the same shape as
+  `errHelpRequested`/`errFlagUsage`:** the command already printed everything
+  the user needs (an interrupted turn, whose partial reply is on screen) and
+  only needs the non-zero exit status, without `main` restating it in a
+  slightly different voice.
 - **Interactive password entry only** (`login.go`) — no `--password` flag, no
   environment variable, matching `cmd/create-superuser`. A flag would put the
   password in shell history and in every process listing on the machine.
@@ -118,6 +151,10 @@ milestone 2.
   `loadProfile`, so they're reachable without a network or a terminal).
 - `chats_test.go` — `truncationNotice`, `humanizeSince`, `sanitizeCell`,
   `normalizeResultsForJSON` (nil-vs-empty `results`).
+- `prompt_test.go` — `flagWasSet`'s empty-vs-absent distinction,
+  `readPipedStdin` over a pipe, a redirected file, and a non-pipe (the
+  no-hang guard), `localTimezone`'s `$TZ` preference and `"Local"` rejection,
+  and that `usage` documents one-shot mode.
 - No test exercises `runLogin`'s interactive prompt/network path or
   `runChats` end to end — both talk to a real network and a real terminal,
   which is exactly what the milestone's live end-to-end check

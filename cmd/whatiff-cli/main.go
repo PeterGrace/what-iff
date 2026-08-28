@@ -1,7 +1,8 @@
 // Command whatiff-cli (installed as `wi`) is a terminal client for WhatIff.
 //
-// Milestone 1 provides `login` and `chats`. Conversation handling arrives with
-// the turn engine in milestone 2.
+// It provides `login` and `chats`, plus the non-interactive turn `wi -p`,
+// which runs one prompt through the turn engine (internal/cli/engine) and
+// exits. The interactive TUI arrives in milestone 3.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/client"
 	"github.com/theimaginaryfoundation/what-iff/internal/cli/config"
+	"github.com/theimaginaryfoundation/what-iff/internal/cli/oneshot"
 )
 
 func main() {
@@ -38,6 +40,14 @@ func main() {
 	fs.SetOutput(io.Discard)
 	profile := fs.String("profile", os.Getenv("WHATIFF_PROFILE"), "config profile to use")
 	asJSON := fs.Bool("json", false, "emit JSON instead of human-readable output")
+	// -p has no subcommand: `wi -p "..."` is the whole invocation. --prompt
+	// is the same flag spelled out, bound to the same variable, so either
+	// spelling works and the last one given wins.
+	var prompt string
+	fs.StringVar(&prompt, "p", "", "send one prompt non-interactively and exit")
+	fs.StringVar(&prompt, "prompt", "", "same as -p")
+	chatRef := fs.String("chat", "", "chat id or name for -p (default: start a new chat)")
+	quiet := fs.Bool("quiet", false, "with -p, print only the reply")
 
 	switch err := fs.Parse(os.Args[1:]); {
 	case errors.Is(err, flag.ErrHelp):
@@ -52,6 +62,26 @@ func main() {
 	}
 
 	args := fs.Args()
+
+	// -p is checked by whether it was *given*, not by whether it is
+	// non-empty: `echo hi | wi -p ""` is a legitimate way to send a piped
+	// document with no instruction of its own, and treating that as "no -p"
+	// would print the usage text instead.
+	if flagWasSet(fs, "p", "prompt") {
+		if len(args) > 0 {
+			fmt.Fprintf(os.Stderr, "wi: unexpected argument %q after -p (quote the whole prompt)\n", args[0])
+			os.Exit(2)
+		}
+		err := promptExitError(runPrompt(ctx, *profile, oneshot.Options{
+			Prompt:  prompt,
+			ChatRef: *chatRef,
+			JSON:    *asJSON,
+			Quiet:   *quiet,
+		}))
+		exitWith(err)
+		return
+	}
+
 	if len(args) == 0 {
 		usage(os.Stderr)
 		os.Exit(2)
@@ -61,28 +91,54 @@ func main() {
 		os.Exit(0)
 	}
 
-	if err := run(ctx, args[0], args[1:], *profile, *asJSON); err != nil {
-		switch {
-		case errors.Is(err, errHelpRequested):
-			// A subcommand's own FlagSet already printed its usage to stdout
-			// (see parseSubFlags) - nothing left to do here but match the
-			// exit code main's own --help handling above uses.
-			os.Exit(0)
-		case errors.Is(err, errFlagUsage):
-			// A subcommand's own FlagSet already printed the parse error and
-			// its usage to stderr (see parseSubFlags) - do not print err
-			// again here, it would just duplicate that output.
-			os.Exit(2)
-		case errors.Is(err, context.Canceled):
-			// Ctrl-C mid-request: the user asked for this, so it is not an
-			// error worth a scary wrapped message - just say so and leave
-			// with a non-zero status.
-			fmt.Fprintln(os.Stderr, "wi: cancelled")
-			os.Exit(1)
-		default:
-			fmt.Fprintf(os.Stderr, "wi: %v\n", err)
-			os.Exit(1)
+	exitWith(run(ctx, args[0], args[1:], *profile, *asJSON))
+}
+
+// flagWasSet reports whether any of names was given on the command line, as
+// opposed to sitting at its zero value.
+func flagWasSet(fs *flag.FlagSet, names ...string) bool {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		for _, name := range names {
+			if f.Name == name {
+				given = true
+			}
 		}
+	})
+	return given
+}
+
+// exitWith turns a command's error into the process's exit status, and
+// returns normally on success so main can fall off the end.
+func exitWith(err error) {
+	if err == nil {
+		return
+	}
+	switch {
+	case errors.Is(err, errHelpRequested):
+		// A subcommand's own FlagSet already printed its usage to stdout
+		// (see parseSubFlags) - nothing left to do here but match the
+		// exit code main's own --help handling above uses.
+		os.Exit(0)
+	case errors.Is(err, errFlagUsage):
+		// A subcommand's own FlagSet already printed the parse error and
+		// its usage to stderr (see parseSubFlags) - do not print err
+		// again here, it would just duplicate that output.
+		os.Exit(2)
+	case errors.Is(err, context.Canceled):
+		// Ctrl-C mid-request: the user asked for this, so it is not an
+		// error worth a scary wrapped message - just say so and leave
+		// with a non-zero status.
+		fmt.Fprintln(os.Stderr, "wi: cancelled")
+		os.Exit(1)
+	case errors.Is(err, errSilentFailure):
+		// The command already printed whatever the user needs to read;
+		// re-printing it here would just say the same thing twice in a
+		// slightly different voice.
+		os.Exit(1)
+	default:
+		fmt.Fprintf(os.Stderr, "wi: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -91,6 +147,7 @@ func usage(w io.Writer) {
 
 Usage:
   wi [flags] <command> [args]
+  wi -p "<prompt>" [flags]
 
 Commands:
   login    Authenticate against the configured profile
@@ -99,6 +156,14 @@ Commands:
 Flags:
   --profile <name>   Config profile (default: $WHATIFF_PROFILE, then config)
   --json             Emit JSON instead of human-readable output
+  -p, --prompt <s>   Send one prompt non-interactively and exit
+  --chat <id|name>   Chat to send -p to (default: start a new chat)
+  --quiet            With -p, print only the reply
+
+Examples:
+  wi -p "summarize the deploy decision"
+  git diff | wi -p "review this"
+  wi -p "..." --chat deploy-plan --json
 `)
 }
 
@@ -110,9 +175,14 @@ Flags:
 // message of their own because parseSubFlags has already written whatever
 // there was to write; main only needs to tell them apart from a normal error
 // via errors.Is to pick the right exit code.
+//
+// errSilentFailure is the third of the same shape: a command that has
+// already told the user everything they need (an interrupted turn, whose
+// partial reply is on screen) and only needs the non-zero exit status.
 var (
 	errHelpRequested = errors.New("help requested")
 	errFlagUsage     = errors.New("flag usage error")
+	errSilentFailure = errors.New("command already reported the failure")
 )
 
 // parseSubFlags parses fs against args using exactly the stdout/exit-0

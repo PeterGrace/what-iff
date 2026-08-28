@@ -74,9 +74,11 @@
 - Served by nginx (`web/app/nginx.conf`) with a deliberate split cache policy: `index.html` is `no-cache` and the content-hashed `*.js`/`*.css` are `immutable`. The entry point names the hashed bundles, so letting it be cached keeps browsers on a previous deploy's JavaScript — deploys and local rebuilds then appear to have no effect.
 
 ### CLI (`wi`)
-- A second client alongside the Angular SPA: `internal/cli/{config,client}` plus the `cmd/whatiff-cli` binary (installed name `whatiff-cli`; symlink it to `wi` on PATH). It is a pure consumer of the same REST API the SPA uses — it adds no server surface, defines no new endpoints, and does not touch `openapi.yaml`.
-- Milestone 1 provides `wi login` (interactive credential exchange, stored in a `0600` per-profile credential file) and `wi chats` (list chats, table or `--json`). Conversation handling arrives in a later milestone.
-- See `internal/cli/config/_PACKAGE_SUMMARY.md`, `internal/cli/client/_PACKAGE_SUMMARY.md`, and `cmd/whatiff-cli/_PACKAGE_SUMMARY.md` for package-level detail.
+- A second client alongside the Angular SPA: `internal/cli/{config,client,engine,oneshot}` plus the `cmd/whatiff-cli` binary (installed name `whatiff-cli`; symlink it to `wi` on PATH). It is a pure consumer of the same REST API the SPA uses — it adds no server surface, defines no new endpoints, and does not touch `openapi.yaml`.
+- `wi login` (interactive credential exchange, stored in a `0600` per-profile credential file) and `wi chats` (list chats, table or `--json`).
+- `wi -p "<prompt>"` runs one turn non-interactively — streaming to a terminal, buffering to a pipe, `--json` for scripts, `--chat` to target an existing thread, and stdin folded into the prompt (`git diff | wi -p "review this"`). The interactive TUI arrives in a later milestone.
+- **`internal/cli/engine` is the seam** between "a turn happened" and where it came from: an `Engine` produces a `Turn` whose `Event` stream (`Delta` / `Phase` / `Attachment` / `Done` / `Error`) is all any consumer sees. `RemoteEngine` is the only implementation today, and it drives a turn exactly the way the browser does — polling the `chat_message` job, de-duplicating its **cumulative** `draft_deltas` array against a rendered index, and returning at **`inference_complete`** while expression picking and checkpointing finish in the background (see the job-phase walk in the Async jobs section below).
+- See `internal/cli/config/_PACKAGE_SUMMARY.md`, `internal/cli/client/_PACKAGE_SUMMARY.md`, `internal/cli/engine/_PACKAGE_SUMMARY.md`, `internal/cli/oneshot/_PACKAGE_SUMMARY.md`, and `cmd/whatiff-cli/_PACKAGE_SUMMARY.md` for package-level detail.
 
  ### Backend
  - Go API server rooted at `cmd/api-server/main.go` (HTTP server with graceful shutdown).
